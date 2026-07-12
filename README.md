@@ -1,27 +1,59 @@
 <div align="center">
 
-<h1>📡 MiND-Shot</h1>
+<h1>📡 MiND-Shot — Free Autonomous Crypto Trading Signal Bot</h1>
 
-<p><strong>A free, fully-autonomous crypto signal engine driven by five backtested mean-reversion strategies — running entirely on GitHub Actions. No server, no cost, no dependencies.</strong></p>
+<p><strong>MiND-Shot is a free, open-source, serverless crypto trading signal bot that runs entirely on GitHub Actions and sends backtested Bitcoin &amp; Ethereum mean-reversion signals to Telegram — no server, no monthly cost, and zero Python dependencies.</strong></p>
 
+[![Live Dashboard](https://img.shields.io/badge/Live_Dashboard-View_Backtest_Report-8B5CF6?style=for-the-badge&logo=react&logoColor=white)](https://aashir-athar.github.io/MiND-Shot/)
 [![Stars](https://img.shields.io/github/stars/aashir-athar/MiND-Shot?style=for-the-badge&logo=github&color=FFD33D)](https://github.com/aashir-athar/MiND-Shot/stargazers)
 [![License](https://img.shields.io/github/license/aashir-athar/MiND-Shot?style=for-the-badge&color=blue)](./LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/aashir-athar/MiND-Shot/ci.yml?style=for-the-badge&label=ci)](https://github.com/aashir-athar/MiND-Shot/actions/workflows/ci.yml)
-[![Engine](https://img.shields.io/github/actions/workflow/status/aashir-athar/MiND-Shot/engine.yml?style=for-the-badge&label=engine)](https://github.com/aashir-athar/MiND-Shot/actions/workflows/engine.yml)
+[![Deploy Dashboard](https://img.shields.io/github/actions/workflow/status/aashir-athar/MiND-Shot/pages.yml?style=for-the-badge&label=pages)](https://github.com/aashir-athar/MiND-Shot/actions/workflows/pages.yml)
 [![Top language](https://img.shields.io/github/languages/top/aashir-athar/MiND-Shot?style=for-the-badge&logo=python&logoColor=white)](https://github.com/aashir-athar/MiND-Shot)
 
+<a href="https://aashir-athar.github.io/MiND-Shot/"><strong>🔴 Live Dashboard</strong></a> ·
 <a href="#-the-five-strategies"><strong>Strategies</strong></a> ·
 <a href="#-getting-started"><strong>Getting Started</strong></a> ·
 <a href="#-how-it-works"><strong>How It Works</strong></a> ·
+<a href="#-faq"><strong>FAQ</strong></a> ·
 <a href="https://github.com/aashir-athar/MiND-Shot/issues"><strong>Report Bug</strong></a>
 
 </div>
 
 ---
 
-**MiND-Shot** is an open-source **crypto signal engine** that runs as a **GitHub Actions cron job** — $0 hosting, no VPS, and no third-party pip dependencies (pure Python standard library). Its signal brain is a set of **five strategies that were each selected from a 1,620-config backtest sweep** and validated out-of-sample on real BTC/ETH data. Around them sits a full intelligence layer — a self-learning ML ensemble, whale-flow context, a Trade Verdict score, and hard risk controls — and rich entry/exit alerts shipped straight to your Telegram via a webhook (Make.com / n8n / Pipedream) or the direct Bot API.
+## 📖 What is MiND-Shot?
 
-> 🚧 **Active research/automation project.** It is a decision-support tool, **not financial advice** — see [Honest expectations](#-honest-expectations).
+**MiND-Shot** is an open-source **crypto trading signal engine** — an **algorithmic trading bot** for **Bitcoin (BTC)** and **Ethereum (ETH)** that runs as a **GitHub Actions cron job** with **$0 hosting**, no VPS, and **no third-party pip dependencies** (pure Python standard library). Its signal brain is a set of **five mean-reversion strategies**, each selected from a **1,620-config backtest sweep** and validated **out-of-sample** on real BTC/ETH market data. Around them sits a full quantitative-trading intelligence layer — a **self-learning machine-learning ensemble**, **whale-flow** order-flow context, a **Trade Verdict** score, and hard **risk-management** controls — and rich entry/exit **Telegram trading alerts** delivered via a webhook (Make.com / n8n / Pipedream) or the direct Telegram Bot API.
+
+> 🚧 **Active quant research & trading-automation project.** MiND-Shot is a **decision-support tool, not financial advice** — read [Honest expectations](#-honest-expectations) before using it.
+
+### ⚡ Quick facts
+
+| | |
+|---|---|
+| **What it is** | Free, serverless crypto trading signal bot (BTC + ETH) |
+| **How it runs** | GitHub Actions cron — no server, no VPS, $0/month |
+| **Signals** | 5 backtested, ADX-gated mean-reversion strategies (4h chart, long & short) |
+| **Backtest** | 326 trades · 72.7% overall win rate · +27.9% average return per strategy |
+| **Delivery** | Telegram Bot API or webhook (Make.com / n8n / Pipedream) |
+| **Dependencies** | None — pure Python 3.10+ standard library |
+| **Dashboard** | Live React report → **[aashir-athar.github.io/MiND-Shot](https://aashir-athar.github.io/MiND-Shot/)** |
+| **License** | MIT (free & open source) |
+
+## 📊 Live Backtest Dashboard
+
+**→ [aashir-athar.github.io/MiND-Shot](https://aashir-athar.github.io/MiND-Shot/)**
+
+A **React + Vite** single-page **backtest reporting dashboard**, deployed to **GitHub Pages** and **fully automated**: every push regenerates the data from the live engine (`gen_report.py`) and rebuilds the site via GitHub Actions, so the numbers are never hand-typed. It shows:
+
+- **KPI overview** — strategies validated, overall win rate vs the 60% gate, total trades, average return, worst drawdown
+- **Win-rate & return charts** per strategy, with the 60% validation gate marked
+- **Backtest-vs-playbook dumbbell** — how tightly out-of-sample results track the published expectation
+- **Equity curves** for all five $100 accounts, plus a full **326-row trade blotter** (side, entry, exit, P&L, result) filterable by strategy
+- **Sortable summary table** with a validated / failed verdict per strategy
+
+Dark-first, theme-aware, accessible, colorblind-safe charts — built to match the engine's design system.
 
 ## ✨ Features
 
@@ -30,6 +62,7 @@
 | 💸 | **$0 forever** | Runs on a public repo's free GitHub Actions minutes — no server, no VPS |
 | 🐍 | **Zero dependencies** | Pure Python standard library — nothing to `pip install` |
 | 🎯 | **5 backtested strategies** | Range-fading mean-reversion (VWAP · RSI-2 · Stochastic · Z-score), ADX-gated, both directions |
+| 📊 | **Live dashboard** | Automated React/GitHub Pages backtest report — equity curves + full trade blotter |
 | 🧪 | **Self-validating** | `python -m mind_shot.backtest` reproduces the documented win rates on live data; CI runs it |
 | 🧠 | **Self-learning ML** | Bayesian buckets + walk-forward logistic model as an advisory second opinion |
 | 🎛 | **Trade Verdict score** | 0–100 score blending ML confidence, whale flow, funding, and session |
@@ -40,21 +73,23 @@
 
 ## 🎯 The Five Strategies
 
-All five share one edge — **fade an extreme back toward the mean, but only while the market is ranging (`ADX(14) < 25`)** — and each trades **both long and short** on the **4-hour** chart. Backtested at **$100 wallet · 10× · 15%-of-wallet · cross margin · 0.10% round-trip**:
+All five share one edge — **fade an extreme back toward the mean, but only while the market is ranging (`ADX(14) < 25`)** — and each trades **both long and short** on the **4-hour** chart. Backtested at **$100 wallet · 10× leverage · 15%-of-wallet · cross margin · 0.10% round-trip fee**:
 
 | Strategy | Coin | Win rate | Entry | Exit | Stop |
 |---|---|---:|---|---|---|
 | **VWAP-Reversion** | ETH | 78.4% | price ±2σ from VWAP(20) | TP 0.75×ATR | 1.5×ATR |
-| **RSI-2 Reversion** | ETH | 72.3% | RSI(2) < 10 / > 90 | TP 0.75×ATR | 1.5×ATR |
+| **RSI-2 Reversion** | ETH | 72.3% | RSI(2) &lt; 10 / &gt; 90 | TP 0.75×ATR | 1.5×ATR |
 | **VWAP-Reversion (revert)** | ETH | 70.0% | price ±2σ from VWAP(20) | back to VWAP | 2.0×ATR |
-| **Stochastic Reversion** | ETH | 75.9% | %K(14) < 20 / > 80 | TP 0.75×ATR | 2.0×ATR |
+| **Stochastic Reversion** | ETH | 75.9% | %K(14) &lt; 20 / &gt; 80 | TP 0.75×ATR | 2.0×ATR |
 | **Z-Score Reversion** | BTC | 65.1% | ±1.5σ from SMA(20) | back to mean | 3.0×ATR |
 
-These numbers are **in-sample backtests, not promises.** Win rate alone is not edge — see [Honest expectations](#-honest-expectations). The full research lives in the project notes; the strategy definitions are in [`mind_shot/strategies.py`](./mind_shot/strategies.py).
+These numbers are **in-sample backtests, not promises.** Win rate alone is not edge — see [Honest expectations](#-honest-expectations). Explore them interactively on the **[live dashboard](https://aashir-athar.github.io/MiND-Shot/)**; the definitions live in [`mind_shot/strategies.py`](./mind_shot/strategies.py).
 
 ## 🛠️ Tech Stack
 
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=white)
 ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white)
 ![Kraken](https://img.shields.io/badge/Kraken_API-5741D9?style=for-the-badge&logo=kraken&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)
@@ -63,6 +98,7 @@ These numbers are **in-sample backtests, not promises.** Win rate alone is not e
 |---|---|
 | **Language** | Python 3.10+ (standard library only) |
 | **Runtime** | GitHub Actions scheduled workflows (cron) |
+| **Dashboard** | React 19 + Vite, deployed to GitHub Pages via Actions |
 | **Market data** | Kraken public OHLC for the live feed (reachable from GitHub Actions; Binance geo-blocks the US runner IPs). The backtest validates against committed Binance 4h fixtures. |
 | **Context** | Binance whale-flow · CoinGecko dominance · alternative.me Fear & Greed |
 | **ML** | Bayesian buckets + walk-forward logistic ensemble |
@@ -92,10 +128,14 @@ TG_CHAT_ID  = 123456789
 If both are set, `WEBHOOK_URL` wins. Optional repo **variables**: `LEVERAGE` (default `10`), `ACCOUNT_USD` (`100`), `ALLOC_PCT` (`15`).
 
 ### 3. Enable Actions
-Open the **Actions** tab and enable workflows. Three are included:
+Open the **Actions** tab and enable workflows. Four are included:
 - **MiND-Shot Engine** — polls every few minutes and ships signals
 - **Weekly ML Retrain** — retrains the logistic model every Sunday
 - **CI** — runs the test suite + strategy validation on every push
+- **Deploy Dashboard** — regenerates the backtest data and publishes the GitHub Pages dashboard
+
+### 4. Publish the dashboard (optional)
+**Settings → Pages → Build and deployment → Source: GitHub Actions.** The **Deploy Dashboard** workflow then builds and publishes your own copy of the backtest report at `https://<you>.github.io/MiND-Shot/`.
 
 ## 📖 Usage
 
@@ -130,7 +170,7 @@ Each entry POSTs JSON; the `text` field is pre-formatted Telegram HTML ready to 
   "text": "🟢 ... MiND-Shot LONG ..."
 }
 ```
-TP / SL / exit events use `type: "event"` with `event: "tp" | "sl" | "exit"`.
+TP / SL / exit events use `type: "event"` with `event: "tp" | "sl" | "exit"`. All dynamic text is HTML-escaped, so `parse_mode=HTML` delivery never breaks on characters like `<` or `>`.
 
 ## 🧠 How It Works
 
@@ -144,15 +184,18 @@ TP / SL / exit events use `type: "event"` with `event: "tp" | "sl" | "exit"`.
 
 The strategies are **self-validating** — the same indicator/strategy code the live engine uses is replayed **offline** over committed fixtures of the original backtest window (`tests/fixtures/*_4h.csv`):
 ```bash
-python -m mind_shot.backtest
+python -m mind_shot.backtest      # prints the validation report
+python gen_report.py              # regenerates the dashboard data (web/public/backtest.json)
 ```
-It prints each strategy's win rate, trade count, and $100→ result, and fails if any strategy drifts materially from its documented numbers. It needs no network, so CI runs it deterministically on every push.
+It prints each strategy's win rate, trade count, and $100→ result, and fails if any strategy drifts materially from its documented numbers. `gen_report.py` additionally **asserts its per-trade replay reproduces the official backtest** before writing the dashboard data, so the published blotter can never drift from the validated engine. Both need no network, so CI runs them deterministically on every push.
 
 ## 🧰 Development
 ```bash
 python -m unittest discover -s tests -v      # unit tests (no network)
 python -m mind_shot.backtest                 # strategy validation (live data)
 OUTPUT_JSON=1 python mind_shot_engine.py      # one local dry-run (no secrets = no alerts sent)
+
+cd web && npm install && npm run dev          # run the dashboard locally (Vite dev server)
 ```
 
 <details>
@@ -168,17 +211,45 @@ mind_shot/
 ├── context.py        # Fear & Greed / dominance / funding
 ├── whale.py          # whale-flow signals
 ├── intelligence.py   # Trade Verdict + analytics
-├── notifier.py       # delivery + alert formatting
+├── notifier.py       # delivery + alert formatting (HTML-escaped)
 ├── state.py          # atomic JSON state
 ├── config.py         # env-driven configuration
 ├── engine.py         # poll orchestration
 └── backtest.py       # in-repo validation backtest
+web/                  # React + Vite backtest dashboard (GitHub Pages)
+gen_report.py         # backtest -> web/public/backtest.json (trades + equity), replay-verified
 mind_shot_engine.py   # entrypoint (used by the engine workflow / Electron host)
 ml_trainer.py         # weekly walk-forward trainer
 tests/                # unit tests + backtest fixtures (committed 4h playbook data)
-.github/workflows/    # engine.yml · retrain.yml · ci.yml
+.github/workflows/    # engine.yml · retrain.yml · ci.yml · pages.yml
 ```
 </details>
+
+## ❓ FAQ
+
+**Is MiND-Shot free?**
+Yes. MiND-Shot is 100% free and open source (MIT). It runs on a public repository's free GitHub Actions minutes, so there is no server bill, VPS, or subscription.
+
+**Do I need a server or VPS to run this crypto signal bot?**
+No. Everything runs serverless on GitHub Actions cron. Fork the repo, add one delivery secret, enable Actions — that's it.
+
+**Which coins and timeframe does it trade?**
+Bitcoin (BTC) and Ethereum (ETH) on the 4-hour chart, taking both long and short signals.
+
+**How are the trading signals generated?**
+Five mean-reversion strategies fade price extremes (VWAP, RSI-2, Stochastic, Z-score) back toward the mean, but only while the market is ranging (`ADX(14) < 25`). A self-learning ML ensemble acts as an advisory second opinion.
+
+**How do I get the signals?**
+As formatted alerts in Telegram — either through the direct Telegram Bot API or via a webhook automation platform such as Make.com, n8n, or Pipedream.
+
+**Is this financial advice?**
+No. MiND-Shot is an educational, decision-support tool. Backtested results are in-sample and do not guarantee future performance — paper-trade first and manage your own risk.
+
+**Can I see the backtest results without installing anything?**
+Yes — the live dashboard at [aashir-athar.github.io/MiND-Shot](https://aashir-athar.github.io/MiND-Shot/) shows the full backtest report, equity curves, and every trade.
+
+**What are the dependencies?**
+The engine has none — pure Python standard library. Only the optional dashboard uses Node/React to build.
 
 ## ⚠️ Honest Expectations
 
@@ -193,8 +264,8 @@ tests/                # unit tests + backtest fixtures (committed 4h playbook da
 - [x] In-repo backtest + unit tests + CI
 - [x] Self-learning ML ensemble + weekly walk-forward retrain
 - [x] Telegram / webhook alert delivery
+- [x] **Backtest reporting dashboard (React + GitHub Pages, fully automated)**
 - [ ] Configurable strategy set via repo variables
-- [ ] Backtest reporting dashboard
 
 ## 🤝 Contributing
 Contributions are welcome. For major changes, please open an issue first. Fork → branch (`git checkout -b feat/your-idea`) → commit → open a PR. CI must pass.
@@ -213,6 +284,6 @@ Distributed under the **MIT License**. See [LICENSE](./LICENSE) for details.
 <div align="center">
 <sub>Built by <a href="https://github.com/aashir-athar">aashir-athar</a> · If MiND-Shot helped you, consider leaving a ⭐</sub>
 <br/><br/>
-<sub><strong>Keywords:</strong> crypto trading signal engine · mean-reversion strategies · algorithmic trading bot · GitHub Actions cron · Bitcoin &amp; Ethereum signals · Binance API · Telegram trading alerts · Python trading automation · serverless trading bot</sub>
+<sub><strong>Keywords:</strong> free crypto trading bot · crypto trading signals · algorithmic trading bot · automated trading bot · Bitcoin trading bot · Ethereum trading signals · BTC ETH signals · mean-reversion strategy · backtesting dashboard · quantitative trading · quant trading Python · GitHub Actions trading bot · serverless trading bot · Telegram crypto signals · Telegram trading alerts · Make.com / n8n / Pipedream webhook · Kraken API · Binance whale flow · machine-learning trading · open-source trading bot · no-cost crypto signals</sub>
 </div>
 </div>
