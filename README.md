@@ -64,7 +64,7 @@ Dark-first, theme-aware, accessible, colorblind-safe charts — built to match t
 | 🎯 | **5 backtested strategies** | Range-fading mean-reversion (VWAP · RSI-2 · Stochastic · Z-score), ADX-gated, both directions |
 | 📊 | **Live dashboard** | Automated React/GitHub Pages backtest report — equity curves + full trade blotter |
 | 🧪 | **Self-validating** | `python -m mind_shot.backtest` reproduces the documented win rates on live data; CI runs it |
-| 🧠 | **Self-learning ML** | Calibrated online ensemble — Bayesian context buckets, FTRL-Proximal logistic, and Hedge expert weighting with drift detection — learning from every closed trade |
+| 🧠 | **Self-learning ML** | Calibrated online ensemble — Bayesian context buckets, FTRL-Proximal logistic, cross-strategy pooled learning, and Hedge expert weighting with drift detection — learning from every closed trade |
 | 🎛 | **Trade Verdict score** | 0–100 score blending ML confidence, whale flow, funding, and session |
 | 🐋 | **Whale-flow signals** | Binance Futures long/short ratio, open interest, taker buy/sell pressure |
 | 🛡️ | **Risk controls** | Daily loss limit, max concurrent trades, post-SL cool-down |

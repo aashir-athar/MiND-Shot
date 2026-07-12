@@ -256,6 +256,62 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertAlmostEqual(node["hedge"]["trained"], ml.HEDGE_INIT["trained"], places=9)
 
 
+class TestPoolAndFeatures(unittest.TestCase):
+    """v3: cross-strategy pooled learning, failure-mode features, EV helper."""
+
+    def test_pool_transfers_context_across_strategies(self):
+        node_a = ml.empty_ml()          # strategy A teaches the shared pool…
+        node_b = ml.empty_ml()          # …strategy B benefits without own data
+        shared = ml.empty_shared()
+        for _ in range(50):
+            for snap, won in ((snap_for(vol_b=2), False), (snap_for(vol_b=0), True)):
+                ml.predict(node_a, snap, shared)
+                ml.update(node_a, snap, won, shared=shared)
+        p_bad = ml.predict(node_b, snap_for(vol_b=2), shared)
+        p_good = ml.predict(node_b, snap_for(vol_b=0), shared)
+        self.assertGreater(p_good, p_bad + 0.03,
+                           f"pooled context did not transfer: {p_good} vs {p_bad}")
+
+    def test_pool_sleeps_without_shared_node(self):
+        node = ml.empty_ml()
+        snap = snap_for()
+        ml.predict(node, snap)                          # no shared passed
+        self.assertNotIn("pool", snap["_pred"]["experts"])
+        teach(node, [(snap_for(), True)] * 30)
+        self.assertAlmostEqual(node["hedge"].get("pool", ml.HEDGE_INIT["pool"]),
+                               ml.HEDGE_INIT["pool"], places=9)
+
+    def test_breakeven_probability(self):
+        self.assertAlmostEqual(ml.breakeven_p("vwap_bracket_eth"), 1.5 / 2.25, places=6)
+        self.assertIsNone(ml.breakeven_p("zscore_revert_btc"))     # revert: no fixed payoff
+        self.assertIsNone(ml.breakeven_p("nonexistent"))
+
+    def test_new_failure_mode_features(self):
+        closes = [100.0 * (1.012 ** k) for k in range(200)]        # strong uptrend
+        series = {"atr": [2.0] * 200, "rsi14": [55.0] * 200, "adx": [20.0] * 200,
+                  "closes": closes, "vwap_z": [-2.6] * 200}
+        snap = ml.build_snapshot(series, 190, "vwap_bracket_eth", 1_700_000_000,
+                                 side="long", funding=0.08)
+        x = snap["x"]
+        for key in ("t5d", "t20d", "side_t5", "side_t20", "fund", "side_fund", "stretch"):
+            self.assertIn(key, x)
+            self.assertTrue(math.isfinite(x[key]))
+        self.assertGreater(x["t20d"], 0)                            # uptrend detected
+        self.assertGreater(x["fund"], 1.0)                          # 0.08 / 0.05 scale
+        # long at vwap_z=-2.6 with trigger -2.0 → stretched 0.6σ beyond trigger
+        self.assertAlmostEqual(x["stretch"], 0.6, places=6)
+
+    def test_shared_node_json_safe_and_bounded(self):
+        shared = ml.empty_shared()
+        node = ml.empty_ml()
+        for k in range(120):
+            snap = snap_for(vol_b=k % 3)
+            ml.predict(node, snap, shared)
+            ml.update(node, snap, k % 3 != 0, shared=shared)
+        json.dumps(shared, allow_nan=False)
+        self.assertLessEqual(len(shared["ftrl"]["z"]), 40)          # feature space is fixed
+
+
 class TestTrainerCore(unittest.TestCase):
     def test_logistic_learns_separable_data(self):
         import ml_trainer as t

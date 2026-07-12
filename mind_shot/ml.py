@@ -5,7 +5,7 @@ A calibrated online ensemble that learns from every closed trade and carries an
 honest, measurable record of whether it is actually helping. It never invents a
 signal — it only scores one (and may veto it when ``ML_GATING_ENABLED``).
 
-Four experts predict P(win) at entry time; their predictions are frozen into the
+Five experts predict P(win) at entry time; their predictions are frozen into the
 trade's ML snapshot so learning at close time is strictly prequential (predict
 first, learn after — no hindsight):
 
@@ -18,6 +18,11 @@ first, learn after — no hindsight):
              over bucket one-hots plus scaled numeric context features, predicting
              a residual on the base-rate logit. L1 keeps it sparse; per-coordinate
              learning rates keep it stable on tiny samples.
+  • POOL   — the cross-strategy context memory (``__global.ml_shared``): every
+             strategy's closed trade teaches it, and its context evidence votes
+             in log-odds deltas applied to the predicting strategy's own base
+             rate, so knowledge transfers across the five strategies. Asleep
+             when no shared node is passed.
   • TRAINED — the weekly walk-forward directional model (``ml_trainer.py``),
              made side-aware: P(favorable move) = P(up) for longs, 1−P(up) for
              shorts. Absent (asleep) when no model / not stamped at entry.
@@ -81,10 +86,13 @@ PH_LAMBDA = 3.0              # Page–Hinkley alarm threshold
 PH_MIN_N = 20                # trades before drift can fire
 DRIFT_EXTRA_DECAY = 0.85     # counts multiplier applied on drift
 PROB_FLOOR, PROB_CEIL = 0.02, 0.98
-EXPERTS = ("base", "buckets", "ftrl", "trained")
+POOL_LOGIT_CAP = 2.0         # cap on the cross-strategy pool's log-odds vote
+EXPERTS = ("base", "buckets", "ftrl", "pool", "trained")
 # Start base-heavy: the safe expert carries a fresh node; the context experts and
 # the (historically weak) trained model must EARN weight through realised log-loss.
-HEDGE_INIT = {"base": 0.55, "buckets": 0.20, "ftrl": 0.20, "trained": 0.05}
+# ``pool`` is the cross-strategy context expert — five strategies share one context
+# memory, so it starts with more evidence behind it than the per-strategy pair.
+HEDGE_INIT = {"base": 0.45, "buckets": 0.15, "ftrl": 0.15, "pool": 0.20, "trained": 0.05}
 
 _DECAY = 0.5 ** (1.0 / HALF_LIFE_TRADES)
 
@@ -162,6 +170,31 @@ def empty_ml() -> Dict[str, Any]:
     }
 
 
+def empty_shared() -> Dict[str, Any]:
+    """The cross-strategy context memory, stored once in ``__global.ml_shared``.
+
+    Every strategy's closed trade teaches it; every strategy's prediction can
+    read it. It stores only strategy-agnostic evidence — context buckets
+    (vol/RSI/session) and an FTRL residual model — never the ``strat`` dimension,
+    so what it learns ("high funding kills mean-reversion entries") transfers."""
+    return {
+        "version": 1,
+        "dw": 0.0, "dl": 0.0,
+        "dims": {d: {} for d in ("vol", "rsi", "ses")},
+        "ftrl": {"z": {}, "n": {}},
+    }
+
+
+def breakeven_p(strategy_id: str) -> Optional[float]:
+    """Win probability needed to break even given the strategy's fixed R:R —
+    ``sl/(sl+tp)`` in ATR units (fees excluded; they nudge it slightly higher).
+    ``None`` for revert strategies, whose payoff is not fixed."""
+    s = _STRAT_BY_ID.get(strategy_id)
+    if not s or s.tp_atr is None or (s.sl_atr + s.tp_atr) <= 0:
+        return None
+    return s.sl_atr / (s.sl_atr + s.tp_atr)
+
+
 def _prior_p(strategy_id: str) -> float:
     """Tempered prior win rate: average of the (in-sample) backtest number and a
     conservative live expectation, so a fresh node neither hypes nor sandbags."""
@@ -181,6 +214,17 @@ def _ensure_v2(ml: Dict[str, Any]) -> Dict[str, Any]:
     a corrupt field can therefore never half-destroy the original evidence. If
     the build itself fails, the raw node is preserved under ``legacy_raw``."""
     if isinstance(ml.get("version"), (int, float)) and ml["version"] >= ML_VERSION:
+        hedge = ml.get("hedge")
+        if isinstance(hedge, dict):        # heal experts added after this node was written
+            healed = False
+            for e in EXPERTS:              # (e.g. "pool") so they mix at their init share
+                if e not in hedge:
+                    hedge[e] = HEDGE_INIT.get(e, 0.1)
+                    healed = True
+            if healed:                     # keep the display invariant Σw = 1
+                total = sum(max(0.0, _finite(w, 0.0)) for w in hedge.values()) or 1.0
+                for e in hedge:
+                    hedge[e] = max(0.0, _finite(hedge[e], 0.0)) / total
         return ml
     fresh = empty_ml()
     try:
@@ -217,6 +261,9 @@ def _ensure_v2(ml: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ── snapshot (entry-time context, stored on the trade) ───────────────────────
+_STRETCH_SCALE = {"rsi2": 10.0, "stoch_k": 10.0}   # 0-100 oscillators; σ-unit sources scale 1.0
+
+
 def build_snapshot(
     series: Dict[str, List[Optional[float]]],
     i: int,
@@ -224,10 +271,18 @@ def build_snapshot(
     time_s: int,
     side: Optional[str] = None,
     trained_prob: Optional[float] = None,
+    funding: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Entry-time context: v1-compatible bucket ints plus scaled numeric features
     and the side-aware trained-model probability, all frozen for prequential
-    learning at close time."""
+    learning at close time.
+
+    v3 features target the strategies' documented failure mode ("a real trend
+    breaking out of the range produces a cluster of losses"): higher-timeframe
+    trend (5-day / 20-day return) and its interaction with trade side, the
+    funding rate at entry, and how far the oscillator is stretched past its
+    trigger. All fixed-scaled and clamped; absent data simply omits the key
+    (the FTRL model is sparse, and missing features carry no weight)."""
     atr = series.get("atr", [])
     vol_regime = 1.0
     if i >= 50 and i < len(atr) and atr[i] and atr[i - 50]:
@@ -255,6 +310,28 @@ def build_snapshot(
         "side": side_v,
         "side_rsi": _clamp(side_v * (rsi_v - 50.0) / 50.0, -3, 3),
     }
+    # Higher-timeframe trend (6 bars/day on 4h): 5-day and 20-day returns, plus
+    # the side interaction — fading INTO a strong trend is the known loss cluster.
+    if i >= 30 and i < len(closes) and closes[i] and closes[i - 30]:
+        t5 = _clamp((closes[i] / closes[i - 30] - 1.0) * 100.0 / 5.0, -3, 3)
+        x["t5d"] = t5
+        x["side_t5"] = _clamp(side_v * t5, -3, 3)
+    if i >= 120 and i < len(closes) and closes[i] and closes[i - 120]:
+        t20 = _clamp((closes[i] / closes[i - 120] - 1.0) * 100.0 / 15.0, -3, 3)
+        x["t20d"] = t20
+        x["side_t20"] = _clamp(side_v * t20, -3, 3)
+    if funding is not None and isinstance(funding, (int, float)) and math.isfinite(funding):
+        x["fund"] = _clamp(funding / 0.05, -3, 3)
+        x["side_fund"] = _clamp(side_v * funding / 0.05, -3, 3)
+    # Stretch: how far past its trigger the strategy's own oscillator sits.
+    strat = _STRAT_BY_ID.get(strategy_id)
+    if strat is not None and side in ("long", "short"):
+        src = series.get(strat.source, [])
+        val = src[i] if (i < len(src) and src[i] is not None) else None
+        if val is not None:
+            scale = _STRETCH_SCALE.get(strat.source, 1.0)
+            beyond = (strat.long_below - val) if side == "long" else (val - strat.short_above)
+            x["stretch"] = _clamp(beyond / scale, -1, 3)
     p_tr: Optional[float] = None
     if trained_prob is not None and side in ("long", "short"):
         p_tr = trained_prob if side == "long" else 1.0 - trained_prob
@@ -267,9 +344,14 @@ def build_snapshot(
     }
 
 
-def _ftrl_features(snap: Dict[str, Any]) -> Dict[str, float]:
+def _ftrl_features(snap: Dict[str, Any], shared: bool = False) -> Dict[str, float]:
+    """Sparse named features. The shared (cross-strategy) variant drops the
+    ``strat`` one-hot — pooled knowledge must be strategy-agnostic."""
     feats: Dict[str, float] = {}
-    for dim, key in (("vol", "vol_b"), ("rsi", "rsi_b"), ("ses", "ses_b"), ("strat", "strat_b")):
+    dims = (("vol", "vol_b"), ("rsi", "rsi_b"), ("ses", "ses_b"))
+    if not shared:
+        dims = dims + (("strat", "strat_b"),)
+    for dim, key in dims:
         b = snap.get(key)
         if b is not None:
             feats[f"{dim}={b}"] = 1.0
@@ -326,15 +408,75 @@ def _ftrl_p(ml: Dict[str, Any], snap: Dict[str, Any], base: float) -> float:
     return _sigmoid(_logit(base) + _clamp(_finite(resid, 0.0), -FTRL_LOGIT_CAP, FTRL_LOGIT_CAP))
 
 
-def _expert_preds(ml: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, float]:
+def _shared_base(shared: Dict[str, Any]) -> float:
+    s_dw = max(0.0, _finite(shared.get("dw", 0.0), 0.0))
+    s_dl = max(0.0, _finite(shared.get("dl", 0.0), 0.0))
+    return (s_dw + TEMPER_TOWARD * PRIOR_STRENGTH) / (s_dw + s_dl + PRIOR_STRENGTH)
+
+
+def _shared_bucket_delta(shared: Dict[str, Any], snap: Dict[str, Any], sb_logit: float) -> float:
+    total = 0.0
+    for dim, key in (("vol", "vol_b"), ("rsi", "rsi_b"), ("ses", "ses_b")):
+        b = snap.get(key)
+        if b is None:
+            continue
+        try:
+            wl = shared.get("dims", {}).get(dim, {}).get(str(b))
+            w = max(0.0, _finite(wl[0], 0.0)) if wl else 0.0
+            l = max(0.0, _finite(wl[1], 0.0)) if wl else 0.0
+        except (TypeError, IndexError, KeyError, AttributeError):
+            continue                        # one corrupt bucket must not mute the rest
+        n = w + l
+        if n <= 0:
+            continue
+        base_p = _sigmoid(sb_logit)
+        p_b = (w + base_p * BUCKET_PRIOR_M) / (n + BUCKET_PRIOR_M)
+        total += (n / (n + BUCKET_SHRINK_M)) * (_logit(p_b) - sb_logit)
+    return total
+
+
+def _shared_ftrl_resid(shared: Dict[str, Any], feats: Dict[str, float]) -> float:
+    f = shared.get("ftrl", {}) if isinstance(shared.get("ftrl"), dict) else {}
+    zs, ns = f.get("z", {}), f.get("n", {})
+    if not isinstance(zs, dict) or not isinstance(ns, dict):
+        return 0.0
+    return sum(_ftrl_weight(_finite(zs.get(k, 0.0), 0.0), max(0.0, _finite(ns.get(k, 0.0), 0.0))) * v
+               for k, v in feats.items())
+
+
+def _pool_p(shared: Dict[str, Any], snap: Dict[str, Any], base: float) -> Optional[float]:
+    """Cross-strategy pool expert: the SHARED context evidence votes in log-odds
+    DELTAS applied to THIS strategy's base rate — so what one strategy's trades
+    teach ("this context loses") transfers to the others even though their base
+    win rates differ. The shared FTRL is trained as a boosting residual ON TOP
+    of the bucket deltas (see ``_shared_update``), so the two terms never
+    double-count the same context. Returns ``None`` (asleep) when no shared
+    node exists; a corrupt shared node puts the expert to sleep rather than
+    degrading all five strategies."""
+    if not isinstance(shared, dict) or not isinstance(shared.get("dims"), dict):
+        return None
+    try:
+        sb_logit = _logit(_shared_base(shared))
+        total = _shared_bucket_delta(shared, snap, sb_logit)
+        total += _shared_ftrl_resid(shared, _ftrl_features(snap, shared=True))
+        return _sigmoid(_logit(base) + _clamp(_finite(total, 0.0), -POOL_LOGIT_CAP, POOL_LOGIT_CAP))
+    except Exception:  # noqa: BLE001 — blast radius of a bad shared node is ALL strategies
+        return None
+
+
+def _expert_preds(ml: Dict[str, Any], snap: Dict[str, Any],
+                  shared: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     """Predictions from every awake expert (each guarded finite-in-(0,1)).
-    ``trained`` sleeps when unstamped."""
+    ``trained`` sleeps when unstamped; ``pool`` sleeps without a shared node."""
     base = _finite(_base_p(ml, snap.get("sid", "")), _prior_p(snap.get("sid", "")))
     preds = {
         "base": base,
         "buckets": _finite(_buckets_p(ml, snap, base), base),
         "ftrl": _finite(_ftrl_p(ml, snap, base), base),
     }
+    p_pool = _pool_p(shared, snap, base) if shared is not None else None
+    if p_pool is not None:
+        preds["pool"] = _finite(p_pool, base)
     p_tr = snap.get("p_tr")
     if isinstance(p_tr, (int, float)) and math.isfinite(p_tr) and 0.0 <= p_tr <= 1.0:
         preds["trained"] = _clamp(float(p_tr), PROB_FLOOR, PROB_CEIL)
@@ -342,26 +484,32 @@ def _expert_preds(ml: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _combine(ml: Dict[str, Any], preds: Dict[str, float]) -> float:
-    """Hedge-weighted log-opinion pool over awake experts, then calibration."""
+    """Hedge-weighted log-opinion pool over awake experts, then calibration.
+    A missing weight defaults to the expert's INIT share (consistent with
+    ``_hedge_update``) so a newly-introduced expert is never silently muted."""
     hedge = ml.get("hedge", {})
-    wsum = sum(max(0.0, _finite(hedge.get(e, 0.0), 0.0)) for e in preds) or 1.0
-    mixed_logit = sum(max(0.0, _finite(hedge.get(e, 0.0), 0.0)) * _logit(p) for e, p in preds.items()) / wsum
+    def w(e):
+        return max(0.0, _finite(hedge.get(e, HEDGE_INIT.get(e, 0.1)), HEDGE_INIT.get(e, 0.1)))
+    wsum = sum(w(e) for e in preds) or 1.0
+    mixed_logit = sum(w(e) * _logit(p) for e, p in preds.items()) / wsum
     cal = ml.get("cal", {"a": 1.0, "b": 0.0})
     a = _clamp(_finite(cal.get("a", 1.0), 1.0), 0.25, 4.0)
     b = _clamp(_finite(cal.get("b", 0.0), 0.0), -1.5, 1.5)
     return _clamp(_sigmoid(a * mixed_logit + b), PROB_FLOOR, PROB_CEIL)
 
 
-def predict(ml: Dict[str, Any], snap: Dict[str, Any]) -> float:
+def predict(ml: Dict[str, Any], snap: Dict[str, Any],
+            shared: Optional[Dict[str, Any]] = None) -> float:
     """Calibrated P(this trade closes as a win).
 
     Freezes the per-expert predictions into ``snap["_pred"]`` so that when the
     trade closes, ``update`` can score exactly what was believed at entry —
-    strictly prequential, no hindsight. Never raises; worst case returns the
+    strictly prequential, no hindsight. Pass the global ``ml_shared`` node to
+    wake the cross-strategy pool expert. Never raises; worst case returns the
     strategy prior."""
     try:
         _ensure_v2(ml)
-        preds = _expert_preds(ml, snap)
+        preds = _expert_preds(ml, snap, shared)
         p = _combine(ml, preds)
         if isinstance(snap, dict):
             snap["_pred"] = {"experts": {k: round(v, 6) for k, v in preds.items()},
@@ -427,6 +575,45 @@ def _ftrl_update(ml: Dict[str, Any], snap: Dict[str, Any], won: bool, base: floa
         ns[k] = n_old + g * g
 
 
+def _shared_update(shared: Dict[str, Any], snap: Dict[str, Any], won: bool) -> None:
+    """Teach the cross-strategy pool: decay, bucket counts, and the shared FTRL
+    trained as a BOOSTING RESIDUAL — its gradient is taken at the margin that
+    already includes the bucket deltas, so it learns only what the buckets
+    miss and the two terms never double-count the same context."""
+    if not isinstance(shared, dict) or "dims" not in shared:
+        return
+    sb_logit = _logit(_shared_base(shared))
+    f = shared.setdefault("ftrl", {"z": {}, "n": {}})
+    zs, ns = f.setdefault("z", {}), f.setdefault("n", {})
+    feats = _ftrl_features(snap, shared=True)
+    margin = sb_logit + _shared_bucket_delta(shared, snap, sb_logit) + _shared_ftrl_resid(shared, feats)
+    p = _sigmoid(_clamp(_finite(margin, sb_logit), sb_logit - POOL_LOGIT_CAP, sb_logit + POOL_LOGIT_CAP))
+    g_scalar = p - (1.0 if won else 0.0)
+    for k, v in feats.items():
+        g = g_scalar * v
+        n_old = max(0.0, _finite(ns.get(k, 0.0), 0.0))
+        w_old = _ftrl_weight(_finite(zs.get(k, 0.0), 0.0), n_old)
+        sigma = (math.sqrt(n_old + g * g) - math.sqrt(n_old)) / FTRL_ALPHA
+        zs[k] = _finite(zs.get(k, 0.0), 0.0) + g - sigma * w_old
+        ns[k] = n_old + g * g
+    shared["dw"] = s_dw * _DECAY
+    shared["dl"] = s_dl * _DECAY
+    for dim in shared["dims"].values():
+        for wl in dim.values():
+            wl[0] *= _DECAY
+            wl[1] *= _DECAY
+    inc_w, inc_l = (1.0, 0.0) if won else (0.0, 1.0)
+    shared["dw"] += inc_w
+    shared["dl"] += inc_l
+    for dim, key in (("vol", "vol_b"), ("rsi", "rsi_b"), ("ses", "ses_b")):
+        b = snap.get(key)
+        if not isinstance(b, int):
+            continue
+        wl = shared["dims"].setdefault(dim, {}).setdefault(str(b), [0.0, 0.0])
+        wl[0] += inc_w
+        wl[1] += inc_l
+
+
 def _cal_update(ml: Dict[str, Any], mixed_logit: float, won: bool) -> None:
     cal = ml["cal"]
     a, b = cal.get("a", 1.0), cal.get("b", 0.0)
@@ -476,6 +663,7 @@ def update(
     won: bool,
     gross_profit: float = 0.0,
     gross_loss: float = 0.0,
+    shared: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Fold one closed trade back into every layer of the learner.
 
@@ -524,6 +712,11 @@ def update(
                         ml["hedge"][e] = 0.75 * ml["hedge"][e] + 0.25 * HEDGE_INIT.get(e, 0.1)
 
         _ftrl_update(ml, snap, won, base_before)
+        if shared is not None:
+            try:
+                _shared_update(shared, snap, won)
+            except Exception:  # noqa: BLE001 — pooled learning is additive, never fatal
+                pass
         _decay_counts(ml)
         inc_w, inc_l = (1.0, 0.0) if won else (0.0, 1.0)
         ml["dw"] += inc_w
@@ -623,5 +816,6 @@ def apply_trained_model(model: Optional[Dict[str, Any]], candles: Sequence[Candl
 __all__ = [
     "ML_VERSION", "EXPERTS",
     "vol_bucket", "rsi_bucket", "session_bucket", "strategy_bucket", "laplace",
-    "empty_ml", "build_snapshot", "predict", "update", "summary", "apply_trained_model",
+    "empty_ml", "empty_shared", "breakeven_p",
+    "build_snapshot", "predict", "update", "summary", "apply_trained_model",
 ]

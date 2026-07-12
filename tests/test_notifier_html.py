@@ -29,8 +29,10 @@ def test_all_alerts_are_valid_telegram_html():
     for strat in STRATEGIES:
         tr = _trade(strat)
         _, entry_txt = entry_alert(tr, strat, 0.6, adx=18.0)
+        _, entry_ev = entry_alert(tr, strat, 0.72, adx=18.0, breakeven=0.667)
         _, event_txt = event_alert({"type": "tp", "price": 101.0}, tr, strat)
-        for txt in (entry_txt, event_txt):
+        assert "breakeven" in entry_ev and "72%" in entry_ev, "EV advisory line missing"
+        for txt in (entry_txt, entry_ev, event_txt):
             bad = _BAD.search(txt)
             assert bad is None, (
                 f"{strat.id}: raw '<' at offset {bad.start()} would break Telegram HTML:\n"

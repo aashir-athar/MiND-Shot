@@ -144,7 +144,8 @@ def _advance_open_trade(
         payload, text = notifier.event_alert(ev, trade, strategy)
         notifier.deliver(payload, text)
     if closed and info:
-        ml.update(st["ml"], trade.ml_snap, info["won"], info["gross_profit"], info["gross_loss"])
+        ml.update(st["ml"], trade.ml_snap, info["won"], info["gross_profit"], info["gross_loss"],
+                  shared=gs.setdefault("ml_shared", ml.empty_shared()))
         _record_close(gs, trade, info)
         st["active_trade"] = None
         res["trade_closed"] = True
@@ -180,8 +181,8 @@ def _maybe_enter(
     except Exception:  # noqa: BLE001 — advisory input only
         trained_prob = None
     snap = ml.build_snapshot(series, confirm_idx, strategy.id, candles[confirm_idx][T],
-                             side=side.value, trained_prob=trained_prob)
-    ml_conf = ml.predict(st["ml"], snap)
+                             side=side.value, trained_prob=trained_prob, funding=funding)
+    ml_conf = ml.predict(st["ml"], snap, shared=gs.setdefault("ml_shared", ml.empty_shared()))
 
     blocked = _risk_block(strategy, state, gs, funding)
     ml_trades = st["ml"].get("total_trades", 0)
@@ -196,8 +197,12 @@ def _maybe_enter(
         if trade is not None:
             st["active_trade"] = trade.to_dict()
             res["active_trade"] = st["active_trade"]
-            res["new_entry"] = {"side": trade.side, "entry": trade.entry, "ml_conf": round(ml_conf, 4)}
-            payload, text = notifier.entry_alert(trade, strategy, ml_conf, adx=series["adx"][confirm_idx])
+            breakeven = ml.breakeven_p(strategy.id)
+            res["new_entry"] = {"side": trade.side, "entry": trade.entry, "ml_conf": round(ml_conf, 4),
+                                "breakeven": round(breakeven, 4) if breakeven else None,
+                                "ev_ok": (ml_conf > breakeven) if breakeven else None}
+            payload, text = notifier.entry_alert(trade, strategy, ml_conf,
+                                                 adx=series["adx"][confirm_idx], breakeven=breakeven)
             notifier.deliver(payload, text)
             log.info("[%s] NEW %s @ %s  ml=%.1f%%", strategy.id, trade.side.upper(),
                      notifier.fmt(trade.entry), ml_conf * 100)

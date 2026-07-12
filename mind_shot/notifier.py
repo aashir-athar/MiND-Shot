@@ -88,7 +88,8 @@ def _leg(entry: float, level: float) -> Tuple[float, float, float]:
     return move_pct, usd, acct_pct
 
 
-def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | None = None) -> Tuple[Dict[str, Any], str]:
+def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | None = None,
+                breakeven: float | None = None) -> Tuple[Dict[str, Any], str]:
     """Build the (payload, html_text) pair for a new entry."""
     lev = config.LEVERAGE
     margin, notional = _sizing()
@@ -100,11 +101,20 @@ def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | N
     wr = f"🏆 <i>{strategy.backtest_win_rate:.0f}% backtest</i>" if strategy.backtest_win_rate else ""
     adx_str = f"   ·   📐 ADX <b>{adx:.0f}</b> (range ✓)" if adx is not None else ""
 
+    # Advisory expected-value read: calibrated win odds vs the R:R breakeven.
+    # Informational only — it never blocks a signal.
+    ev_str = ""
+    if breakeven is not None:
+        edge_ok = ml_conf > breakeven
+        ev_str = (f"🧮 Win odds <b>{ml_conf * 100:.0f}%</b> vs <b>{breakeven * 100:.0f}%</b> breakeven"
+                  f"   ·   {'edge ✓' if edge_ok else 'thin edge ⚠ — consider passing'}")
+
     lines = [
         f"{dot} <b>{side_word}</b>   ·   <code>{_esc(trade.asset)}/USD</code>   ·   <b>{_esc(trade.tf)}</b>   ·   ⚡<code>{lev}×</code>",
         _RULE,
         f"🧩 <b>{_esc(strategy.name)}</b>   {wr}".rstrip(),
         f"🧠 ML <b>{ml_conf * 100:.0f}%</b>{adx_str}",
+    ] + ([ev_str] if ev_str else []) + [
         "",
         f"📍 <b>Entry</b>    <code>{fmt(trade.entry)}</code>",
         f"🛡 <b>Stop</b>     <code>{fmt(trade.sl)}</code>   <b>−{sl_move:.2f}%</b>   ·   −${sl_usd:.2f}",
@@ -144,6 +154,8 @@ def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | N
         "strategy_name": strategy.name,
         "preset": strategy.name,        # back-compat alias for v1 webhook mappings
         "ml_conf": round(ml_conf * 100, 1),
+        "breakeven": round(breakeven * 100, 1) if breakeven is not None else None,
+        "ev_ok": (ml_conf > breakeven) if breakeven is not None else None,
         "leverage": lev,
         "entry": trade.entry,
         "sl": trade.sl,

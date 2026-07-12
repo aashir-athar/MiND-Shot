@@ -21,7 +21,7 @@ import tempfile
 from typing import Any, Dict, List
 
 from . import config
-from .ml import empty_ml  # single source of truth for a fresh ML node  # noqa: F401
+from .ml import empty_ml, empty_shared  # single source of truth for fresh ML nodes  # noqa: F401
 
 log = logging.getLogger("mind_shot.state")
 
@@ -45,6 +45,7 @@ def empty_global_state() -> Dict[str, Any]:
         "account_size": config.ACCOUNT_USD,
         "sl_cooldowns": {},
         "last_weekly_summary": None,
+        "ml_shared": empty_shared(),      # cross-strategy pooled context memory
     }
     state.update(config.DEFAULT_RISK)
     return state

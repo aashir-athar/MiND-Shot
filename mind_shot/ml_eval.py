@@ -17,24 +17,29 @@ Learners compared:
 Also simulates the ``ML_MIN_CONF`` veto gate for each learner: how many trades
 it would have blocked and what those trades actually did.
 
-Run:  python -m mind_shot.ml_eval
+Run:  python -m mind_shot.ml_eval           (playbook fixtures, replay asserted vs backtest)
+      python -m mind_shot.ml_eval --deep    (full committed history — multi-year, multi-regime)
 """
 from __future__ import annotations
 
 import math
+import sys
 from typing import Any, Dict, List, Tuple
 
 from . import ml
 from .backtest import PLAYBOOK_TEST_START_S, _load_fixture, _signal_arrays, run
+from .history import has_deep_history, load_history
 from .models import H, L, O, T
 from .strategies import STRATEGIES, ExitStyle, compute_series
 
 WALLET0, LEVERAGE, ALLOC, FEE, MMR = 100.0, 10.0, 0.15, 0.0005, 0.005
 GATE = 0.40  # config.ML_MIN_CONF default
+WARMUP_BARS = 210
 
 
 # ── trade replay (mirrors backtest.simulate; fidelity asserted in main) ──────
-def replay_trades(strat, candles, series) -> List[Dict[str, Any]]:
+def replay_trades(strat, candles, series, test_start_s=PLAYBOOK_TEST_START_S,
+                  abort_on_bust=True) -> List[Dict[str, Any]]:
     opens = [c[O] for c in candles]
     highs = [c[H] for c in candles]
     lows = [c[L] for c in candles]
@@ -77,10 +82,11 @@ def replay_trades(strat, candles, series) -> List[Dict[str, Any]]:
                 out.append({"sig_i": sig_i, "side": "long" if pos == 1 else "short",
                             "won": pnl > 0, "pnl": pnl, "t": times[nx]})
                 pos = 0
-                if wallet < 5.0:
+                if abort_on_bust and wallet < 5.0:
                     break
+                wallet = max(wallet, 5.01) if not abort_on_bust else wallet
         if pos == 0 and wallet > 5.0:
-            if times[nx] < PLAYBOOK_TEST_START_S or atr[i] is None:
+            if times[nx] < test_start_s or atr[i] is None:
                 continue
             if el[i] or es[i]:
                 pos = 1 if el[i] else -1
@@ -143,10 +149,20 @@ def _score(name: str, rows: List[Tuple[float, bool]]) -> Dict[str, Any]:
 
 
 def main() -> None:
-    official = {r.strategy_id: r for r in run(verbose=False)}
-    data = {a: _load_fixture(a) for a in {s.asset for s in STRATEGIES}}
+    deep = "--deep" in sys.argv
+    assets = {s.asset for s in STRATEGIES}
+    if deep:
+        if not all(has_deep_history(a) for a in assets):
+            print("No deep history committed - run: python tools/fetch_history.py")
+            return
+        data = {a: load_history(a) for a in assets}
+        official = None
+    else:
+        data = {a: _load_fixture(a) for a in assets}
+        official = {r.strategy_id: r for r in run(verbose=False)}
 
     ml_nodes = {s.id: ml.empty_ml() for s in STRATEGIES}
+    shared = ml.empty_shared()               # one cross-strategy pool, like live
     v1s = {s.id: V1Model() for s in STRATEGIES}
     bases = {s.id: BaseRate() for s in STRATEGIES}
     rows: Dict[str, List[Tuple[float, bool]]] = {"v2": [], "v1": [], "base-rate": []}
@@ -155,24 +171,29 @@ def main() -> None:
     for strat in STRATEGIES:
         candles = data[strat.asset]
         series = compute_series(candles)
-        trades = replay_trades(strat, candles, series)
-        off = official[strat.id]
-        assert (len(trades), sum(1 for t in trades if t["won"])) == (off.trades, off.wins), \
-            f"replay diverged from official backtest for {strat.id}"
+        if deep:
+            start_s = candles[WARMUP_BARS][0] if len(candles) > WARMUP_BARS else 0
+            trades = replay_trades(strat, candles, series, test_start_s=start_s, abort_on_bust=False)
+        else:
+            trades = replay_trades(strat, candles, series)
+            off = official[strat.id]
+            assert (len(trades), sum(1 for t in trades if t["won"])) == (off.trades, off.wins), \
+                f"replay diverged from official backtest for {strat.id}"
         for tr in trades:
             snap = ml.build_snapshot(series, tr["sig_i"], strat.id, candles[tr["sig_i"]][T], side=tr["side"])
             events.append((tr["t"], strat.id, snap, tr["won"]))
     events.sort(key=lambda e: e[0])  # global chronology, like live
 
     for _t, sid, snap, won in events:
-        rows["v2"].append((ml.predict(ml_nodes[sid], snap), won))
+        rows["v2"].append((ml.predict(ml_nodes[sid], snap, shared), won))
         rows["v1"].append((v1s[sid].predict(snap), won))
         rows["base-rate"].append((bases[sid].predict(snap), won))
-        ml.update(ml_nodes[sid], snap, won)
+        ml.update(ml_nodes[sid], snap, won, shared=shared)
         v1s[sid].update(snap, won)
         bases[sid].update(snap, won)
 
-    print(f"Prequential evaluation - {len(events)} playbook trades, test-then-train, global chronology")
+    label = "DEEP multi-year history" if deep else "playbook fixtures (replay asserted vs backtest)"
+    print(f"Prequential evaluation - {len(events)} trades over {label}, test-then-train, global chronology")
     print(f"{'model':<10} {'logloss':>8} {'brier':>7} {'acc':>6}   gate<{GATE:.2f}: blocked (of which wins)")
     print("-" * 78)
     scores = {name: _score(name, r) for name, r in rows.items()}

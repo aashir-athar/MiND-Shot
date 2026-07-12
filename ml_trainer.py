@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mind_shot import config, indicators as ind
-from mind_shot.backtest import _load_fixture
+from mind_shot.history import load_history
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -86,7 +86,7 @@ def load_candles(asset: str) -> Tuple[List[Tuple], Dict[str, Any]]:
     switch, or a widening gap once the 720-bar Kraken window drifts past the
     fixture end) are detected and logged so a silent data hole can't masquerade
     as a clean training set."""
-    candles = {c[0]: c for c in _load_fixture(asset)}
+    candles = {c[0]: c for c in load_history(asset)}   # deep committed history ∪ fixtures
     n_fix = len(candles)
     n_live = 0
     try:
