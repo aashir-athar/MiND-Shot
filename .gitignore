@@ -4,3 +4,8 @@ __pycache__/
 .env
 *.local
 .DS_Store
+
+# web dashboard
+web/node_modules/
+web/dist/
+web/scripts/_smoke.bundle.mjs
