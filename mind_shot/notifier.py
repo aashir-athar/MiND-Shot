@@ -10,6 +10,7 @@ message shows the real dollar risk and reward for the configured account.
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import urllib.error
@@ -62,6 +63,16 @@ def fmt(price: float) -> str:
     return f"{price:,.2f}" if price >= 1000 else f"{price:,.4f}"
 
 
+def _esc(s: object) -> str:
+    """Escape data before it lands inside an HTML-parse-mode Telegram message.
+
+    Only ``<`` ``>`` ``&`` need escaping; leave quotes alone. Prevents free-text
+    like a strategy description ("%K(14) <20 / >80") from being read as a bogus
+    HTML tag. Wrap DATA values only — never the template's own <b>/<i>/<code> tags.
+    """
+    return html.escape(str(s), quote=False)
+
+
 def _sizing() -> Tuple[float, float]:
     """(margin, notional) in USD for the configured account."""
     margin = config.ACCOUNT_USD * config.ALLOC_PCT / 100.0
@@ -90,9 +101,9 @@ def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | N
     adx_str = f"   ·   📐 ADX <b>{adx:.0f}</b> (range ✓)" if adx is not None else ""
 
     lines = [
-        f"{dot} <b>{side_word}</b>   ·   <code>{trade.asset}/USD</code>   ·   <b>{trade.tf}</b>   ·   ⚡<code>{lev}×</code>",
+        f"{dot} <b>{side_word}</b>   ·   <code>{_esc(trade.asset)}/USD</code>   ·   <b>{_esc(trade.tf)}</b>   ·   ⚡<code>{lev}×</code>",
         _RULE,
-        f"🧩 <b>{strategy.name}</b>   {wr}".rstrip(),
+        f"🧩 <b>{_esc(strategy.name)}</b>   {wr}".rstrip(),
         f"🧠 ML <b>{ml_conf * 100:.0f}%</b>{adx_str}",
         "",
         f"📍 <b>Entry</b>    <code>{fmt(trade.entry)}</code>",
@@ -119,7 +130,7 @@ def entry_alert(trade: Trade, strategy: Strategy, ml_conf: float, adx: float | N
 
     lines += [
         "",
-        f"💡 <i>{strategy.description}</i>",
+        f"💡 <i>{_esc(strategy.description)}</i>",
         "⚠️ <i>Educational, not financial advice — manage your own risk.</i>",
     ]
     text = "\n".join(lines)
@@ -166,9 +177,9 @@ def event_alert(event: Dict[str, Any], trade: Trade, strategy: Strategy) -> Tupl
     money = f"{'+' if usd >= 0 else '−'}${abs(usd):.2f}"
 
     text = (
-        f"{emoji} <b>{label}</b>   ·   <code>{trade.asset}/USD</code>  <b>{trade.tf}</b>\n"
+        f"{emoji} <b>{label}</b>   ·   <code>{_esc(trade.asset)}/USD</code>  <b>{_esc(trade.tf)}</b>\n"
         f"{_RULE}\n"
-        f"🧩 <i>{strategy.name}</i>\n"
+        f"🧩 <i>{_esc(strategy.name)}</i>\n"
         f"💰 <b>{money}</b>   ({acct:+.1f}% acct  ·  {margin_pct:+.0f}% on margin @{lev}×)\n"
         f"📍 @ <code>{fmt(price)}</code>"
     )
