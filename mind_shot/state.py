@@ -21,15 +21,11 @@ import tempfile
 from typing import Any, Dict, List
 
 from . import config
+from .ml import empty_ml  # single source of truth for a fresh ML node  # noqa: F401
 
 log = logging.getLogger("mind_shot.state")
 
 GLOBAL_KEY = "__global"
-
-
-def empty_ml() -> Dict[str, Any]:
-    return {"vol": {}, "rsi": {}, "ses": {}, "strat": {},
-            "total_trades": 0, "wins": 0, "gross_profit": 0.0, "gross_loss": 0.0}
 
 
 def empty_heatmap() -> List[List[List[int]]]:

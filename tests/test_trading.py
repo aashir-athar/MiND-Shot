@@ -79,6 +79,32 @@ class TestManageBracket(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class TestFormingBar(unittest.TestCase):
+    """v2: price levels are detected promptly on the still-forming bar."""
+    strat = STRATEGY_BY_ID["vwap_bracket_eth"]
+
+    def test_stop_detected_on_forming_bar(self):
+        trade = _trade()
+        candles = [(0, 100, 100, 100, 100, 1),
+                   (1, 100, 103, 99, 101, 1),    # closed, untouched
+                   (2, 101, 101, 84, 86, 1)]     # FORMING: low 84 already through sl 85
+        events, closed, info = manage_trade(trade, self.strat, candles, {})
+        self.assertTrue(closed, "stop breached on the forming bar must close promptly")
+        self.assertEqual(events[0]["type"], "sl")
+        self.assertAlmostEqual(info["exit_price"], 85.0)   # booked at the level, like the backtest
+
+    def test_revert_signal_ignored_on_forming_bar(self):
+        strat = STRATEGY_BY_ID["zscore_revert_btc"]
+        trade = _trade(style="revert", tp=None, sl=85.0, strat="zscore_revert_btc")
+        candles = [(0, 100, 100, 100, 100, 1),
+                   (1, 100, 103, 99, 101, 1),    # closed; z still extended → no exit
+                   (2, 101, 106, 101, 105, 1)]   # FORMING; z reverted but bar not final
+        series = {"adx": [None, 20.0, 20.0], "zscore": [None, -1.5, 0.5],
+                  "sma20": [None, 104.0, 104.0]}
+        events, closed, info = manage_trade(trade, strat, candles, series)
+        self.assertFalse(closed, "signal exits must wait for the bar to close")
+
+
 class TestManageRevert(unittest.TestCase):
     strat = STRATEGY_BY_ID["zscore_revert_btc"]
 

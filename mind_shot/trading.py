@@ -7,9 +7,12 @@ Two exit regimes, exactly as backtested:
               (VWAP-to-VWAP, Z-score-to-mean).
 
 Price-level checks (stop / take-profit) run intrabar against every bar's high/low,
-with the pessimistic rule that the STOP fills first if a bar touches both. The
-revert exit only fires on a *closed* bar — never the still-forming one — so the
-live engine and the backtest agree on what counts as a signal.
+with the pessimistic rule that the STOP fills first if a bar touches both — and
+they run against the still-forming bar too, so a breached stop is detected on the
+next poll (minutes) instead of at bar close (hours). The fill is booked at the
+level itself, exactly as the backtest books it, so live results stay comparable.
+The revert exit only fires on a *closed* bar — never the still-forming one — so
+the live engine and the backtest agree on what counts as a signal.
 """
 from __future__ import annotations
 
@@ -149,17 +152,23 @@ def manage_trade(
         candle = candles[i]
         forming = i == n - 1
 
-        # The still-forming bar is never used to decide an exit — only closed bars,
-        # matching the backtest (which evaluates closed bars and fills revert exits
-        # at the next bar's open).
-        if not forming:
-            hit = _level_hit(trade, candle)
-            if hit is not None:
-                kind, price = hit
-                events.append({"type": kind, "price": price, "time": candle[T]})
+        # Price levels (stop / take-profit) are checked on EVERY bar, including the
+        # still-forming one: its high/low already contain any breach, and a real
+        # stop order would have filled at that level intrabar. Booking at the level
+        # keeps the fill identical to what the backtest books for the same bar —
+        # only the detection latency improves (next poll vs bar close).
+        hit = _level_hit(trade, candle)
+        if hit is not None:
+            kind, price = hit
+            events.append({"type": kind, "price": price, "time": candle[T]})
+            if not forming:
                 trade.last_bar = candle[T]
-                return events, True, _close_info(trade, kind, price)
+            return events, True, _close_info(trade, kind, price)
 
+        if not forming:
+            # Signal-based (revert) exits still need a CLOSED bar — the forming
+            # bar's oscillator value is not final, and the backtest only ever
+            # evaluates closed bars.
             if is_revert and i <= last_closed and strategy.should_exit(series, i, trade.side_enum):
                 exit_idx = i + 1  # fill at next bar's open (exists: i <= n-2)
                 price = candles[exit_idx][O]

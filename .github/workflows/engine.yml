@@ -21,9 +21,13 @@ on:
 permissions:
   contents: write
 
-# Unique group per run so overlapping minute-runs never cancel each other.
+# One FIXED group serialises polls: two staggered cron runs can no longer trade
+# on the same stale state simultaneously (double alerts, lost closes on the
+# push race). Extra queued runs collapse into one pending run — which is ideal,
+# since every poll is identical. cancel-in-progress stays false so a running
+# poll always finishes committing its state.
 concurrency:
-  group: mind-shot-${{ github.run_id }}
+  group: mind-shot-engine
   cancel-in-progress: false
 
 jobs:

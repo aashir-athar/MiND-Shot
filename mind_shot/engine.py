@@ -1,10 +1,25 @@
 """
-Engine orchestration — one poll cycle.
+Engine orchestration — one poll cycle, v2.
 
-Fetches 4h data once per (asset, timeframe) pair, runs every strategy registered
-for that pair, manages open trades, fires alerts, folds outcomes back into the
-self-learning ML, and emits the full dashboard blob — the same schema as v1 so the
-Electron host and any webhook consumers keep working unchanged.
+Pipeline (order matters and is deliberate):
+
+  1. Load state + the weekly trained model.
+  2. Fetch market context FIRST (best-effort) — it powers the funding-pause risk
+     gate at entry time, not just the dashboard. A context outage silently
+     disables that one gate; it never blocks trading.
+  3. Fetch candles once per active (asset, timeframe) pair and compute series.
+  4. Run every strategy: advance its open trade (prompt intrabar SL/TP
+     detection), then look for a fresh entry behind the risk gates and the ML
+     veto. Every closed trade is folded back into the self-learning ML.
+  5. Persist state IMMEDIATELY — trade lifecycle must never depend on the
+     best-effort enrichment below succeeding.
+  6. Fetch whale flow (best-effort), compute verdicts and analytics, and emit
+     the dashboard blob — the same schema as v1 so the Electron host and any
+     webhook consumers keep working unchanged.
+
+Risk gates enforced at entry (first blocking reason wins):
+  daily loss limit · max concurrent trades · post-SL cool-down ·
+  funding-pause threshold (new in v2 — previously documented but never enforced).
 """
 from __future__ import annotations
 
@@ -13,9 +28,10 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config, context, intelligence, market, ml, notifier, whale
+from .market import TF_MIN
 from .models import C, T
 from .state import (
     GLOBAL_KEY,
@@ -25,36 +41,57 @@ from .state import (
     load_trained_model,
     save_state,
 )
-from .strategies import STRATEGIES, active_pairs, compute_series
+from .strategies import STRATEGIES, Strategy, active_pairs, compute_series
 from .trading import Trade, manage_trade, open_trade
 
 log = logging.getLogger("mind_shot.engine")
 
-TF_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
-WARMUP_BARS = 60
+WARMUP_BARS = 60          # bars of history before a signal is trusted
+KLINE_LIMIT = 720         # Kraken's hard cap per OHLC request
+PRICE_SAMPLE_BARS = 48    # closes shipped to the dashboard sparkline
+
+Pair = Tuple[str, str]    # (asset, timeframe)
 
 
-def _risk_block(strategy, state: Dict[str, Any], gs: Dict[str, Any]) -> Optional[str]:
-    """Return a human reason to suppress a fresh entry, or ``None`` to allow it."""
+# ── risk gates ───────────────────────────────────────────────────────────────
+def _risk_block(
+    strategy: Strategy,
+    state: Dict[str, Any],
+    gs: Dict[str, Any],
+    funding: Optional[float] = None,
+) -> Optional[str]:
+    """Return a human-readable reason to suppress a fresh entry, or ``None``.
+
+    Order: daily loss limit → concurrency cap → post-SL cool-down → funding pause.
+    """
     today_r = intelligence.aggregate_periods(gs["daily_r"])["today"]
     if today_r <= gs.get("daily_loss_limit_r", -3.0):
         return f"daily loss limit ({today_r:.2f}R)"
+
     open_count = sum(
         1 for k, v in state.items()
         if k != GLOBAL_KEY and isinstance(v, dict) and v.get("active_trade")
     )
-    if open_count >= gs.get("max_concurrent_trades", 4):
-        return f"{open_count} trades open (max {gs.get('max_concurrent_trades', 4)})"
+    max_open = gs.get("max_concurrent_trades", 4)
+    if open_count >= max_open:
+        return f"{open_count} trades open (max {max_open})"
+
     last_sl = gs.get("sl_cooldowns", {}).get(strategy.id, 0)
     if last_sl > 0:
         cd_min = gs.get("cooldown_minutes_after_sl", 240)
         elapsed = (datetime.now(tz=timezone.utc).timestamp() - last_sl) / 60
         if elapsed < cd_min:
             return f"cool-down after SL ({int(cd_min - elapsed)}min left)"
+
+    threshold = gs.get("funding_pause_threshold")
+    if funding is not None and threshold and abs(funding) > threshold:
+        return f"funding {funding:+.3f}% beyond ±{threshold:.2f}% (market overheated)"
     return None
 
 
+# ── close bookkeeping ────────────────────────────────────────────────────────
 def _record_close(gs: Dict[str, Any], trade: Trade, info: Dict[str, Any]) -> None:
+    """Streaks, cool-downs, daily R, heatmap, and the capped journal."""
     won = info["won"]
     if won:
         gs["cur_win_streak"] += 1
@@ -76,91 +113,161 @@ def _record_close(gs: Dict[str, Any], trade: Trade, info: Dict[str, Any]) -> Non
         gs["journal"] = gs["journal"][-config.JOURNAL_CAP:]
 
 
-def process_strategy(strategy, candles, series, state, gs, results, ml_summary) -> None:
-    st = ensure_strategy(state, strategy.id)
+# ── per-strategy processing ──────────────────────────────────────────────────
+def _base_result(strategy: Strategy, candles: List) -> Dict[str, Any]:
     n = len(candles)
-    last_close = candles[-1][C]
-    sample = candles[-48:] if n >= 48 else candles
-    res: Dict[str, Any] = {
+    sample = candles[-PRICE_SAMPLE_BARS:] if n >= PRICE_SAMPLE_BARS else candles
+    return {
         "strategy": strategy.id, "strategy_name": strategy.name,
         "asset": strategy.asset, "tf": strategy.timeframe,
         "events": [], "new_entry": None, "active_trade": None, "trade_closed": False,
-        "distance_to_signal": None, "candle_close_at": candles[-1][T] * 1000 + TF_MIN[strategy.timeframe] * 60 * 1000,
-        "last_close": last_close, "price_24h": [round(c[C], 6) for c in sample],
+        "distance_to_signal": None,
+        "candle_close_at": candles[-1][T] * 1000 + TF_MIN[strategy.timeframe] * 60 * 1000,
+        "last_close": candles[-1][C],
+        "price_24h": [round(c[C], 6) for c in sample],
     }
-    confirm_idx = n - 2
+
+
+def _advance_open_trade(
+    strategy: Strategy,
+    st: Dict[str, Any],
+    candles: List,
+    series: Dict[str, List],
+    gs: Dict[str, Any],
+    res: Dict[str, Any],
+) -> None:
+    """Walk the open trade over any new bars; alert, close, and teach the ML."""
+    trade = Trade.from_dict(st["active_trade"])
+    events, closed, info = manage_trade(trade, strategy, candles, series)
+    for ev in events:
+        res["events"].append(ev)
+        payload, text = notifier.event_alert(ev, trade, strategy)
+        notifier.deliver(payload, text)
+    if closed and info:
+        ml.update(st["ml"], trade.ml_snap, info["won"], info["gross_profit"], info["gross_loss"])
+        _record_close(gs, trade, info)
+        st["active_trade"] = None
+        res["trade_closed"] = True
+        res["closed_outcome"] = {"won": info["won"], "pnl_r": info["pnl_r"], "kind": info["kind"]}
+        log.info("[%s] CLOSED %s: %s %.3fR", strategy.id, info["kind"].upper(),
+                 "WIN" if info["won"] else "LOSS", info["pnl_r"])
+    else:
+        trade.update_live(candles[-1][C], config.LEVERAGE, int(datetime.now(tz=timezone.utc).timestamp()))
+        st["active_trade"] = trade.to_dict()
+        res["active_trade"] = st["active_trade"]
+
+
+def _maybe_enter(
+    strategy: Strategy,
+    st: Dict[str, Any],
+    candles: List,
+    series: Dict[str, List],
+    state: Dict[str, Any],
+    gs: Dict[str, Any],
+    res: Dict[str, Any],
+    trained_model: Optional[Dict[str, Any]],
+    funding: Optional[float],
+) -> None:
+    """Evaluate the last CLOSED bar for a fresh signal, behind every gate."""
+    confirm_idx = len(candles) - 2
+    side = strategy.entry(series, confirm_idx)
+    if side is None:
+        st["last_signal_bar"] = candles[confirm_idx][T]
+        return
+
+    try:
+        trained_prob = ml.apply_trained_model(trained_model, candles, confirm_idx, strategy.asset)
+    except Exception:  # noqa: BLE001 — advisory input only
+        trained_prob = None
+    snap = ml.build_snapshot(series, confirm_idx, strategy.id, candles[confirm_idx][T],
+                             side=side.value, trained_prob=trained_prob)
+    ml_conf = ml.predict(st["ml"], snap)
+
+    blocked = _risk_block(strategy, state, gs, funding)
+    ml_trades = st["ml"].get("total_trades", 0)
+    if blocked:
+        res["blocked_by"] = blocked
+        log.info("[%s] %s blocked: %s", strategy.id, side.value, blocked)
+    elif config.ML_GATING_ENABLED and ml_trades >= config.ML_MIN_TRADES and ml_conf < config.ML_MIN_CONF:
+        res["blocked_by"] = f"ML conf {ml_conf*100:.1f}% < {config.ML_MIN_CONF*100:.0f}%"
+        log.info("[%s] %s blocked by ML (%.1f%%)", strategy.id, side.value, ml_conf * 100)
+    else:
+        trade = open_trade(strategy, candles, confirm_idx, series, snap)
+        if trade is not None:
+            st["active_trade"] = trade.to_dict()
+            res["active_trade"] = st["active_trade"]
+            res["new_entry"] = {"side": trade.side, "entry": trade.entry, "ml_conf": round(ml_conf, 4)}
+            payload, text = notifier.entry_alert(trade, strategy, ml_conf, adx=series["adx"][confirm_idx])
+            notifier.deliver(payload, text)
+            log.info("[%s] NEW %s @ %s  ml=%.1f%%", strategy.id, trade.side.upper(),
+                     notifier.fmt(trade.entry), ml_conf * 100)
+    st["last_signal_bar"] = candles[confirm_idx][T]
+
+
+def process_strategy(
+    strategy: Strategy,
+    candles: List,
+    series: Dict[str, List],
+    state: Dict[str, Any],
+    gs: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    ml_summary: Dict[str, Any],
+    trained_model: Optional[Dict[str, Any]] = None,
+    funding: Optional[float] = None,
+) -> None:
+    st = ensure_strategy(state, strategy.id)
+    res = _base_result(strategy, candles)
+    confirm_idx = len(candles) - 2
     if confirm_idx >= 0:
         res["distance_to_signal"] = intelligence.distance_to_signal(strategy, series, confirm_idx)
 
-    # ── manage an open trade ──
     if st["active_trade"]:
-        trade = Trade.from_dict(st["active_trade"])
-        events, closed, info = manage_trade(trade, strategy, candles, series)
-        for ev in events:
-            res["events"].append(ev)
-            payload, text = notifier.event_alert(ev, trade, strategy)
-            notifier.deliver(payload, text)
-        if closed and info:
-            ml.update(st["ml"], trade.ml_snap, info["won"], info["gross_profit"], info["gross_loss"])
-            _record_close(gs, trade, info)
-            st["active_trade"] = None
-            res["trade_closed"] = True
-            res["closed_outcome"] = {"won": info["won"], "pnl_r": info["pnl_r"], "kind": info["kind"]}
-        else:
-            trade.update_live(last_close, config.LEVERAGE, candles[-1][T])
-            st["active_trade"] = trade.to_dict()
-            res["active_trade"] = st["active_trade"]
+        _advance_open_trade(strategy, st, candles, series, gs, res)
 
-    # ── look for a fresh entry ──
-    if st["active_trade"] is None and confirm_idx >= WARMUP_BARS and candles[confirm_idx][T] > st["last_signal_bar"]:
-        side = strategy.entry(series, confirm_idx)
-        if side is not None:
-            snap = ml.build_snapshot(series, confirm_idx, strategy.id, candles[confirm_idx][T])
-            ml_conf = ml.predict(st["ml"], snap)
-            blocked = _risk_block(strategy, state, gs)
-            ml_trades = st["ml"].get("total_trades", 0)
-            if blocked:
-                res["blocked_by"] = blocked
-                log.info("[%s] %s blocked: %s", strategy.id, side.value, blocked)
-            elif config.ML_GATING_ENABLED and ml_trades >= config.ML_MIN_TRADES and ml_conf < config.ML_MIN_CONF:
-                res["blocked_by"] = f"ML conf {ml_conf*100:.1f}% < {config.ML_MIN_CONF*100:.0f}%"
-                log.info("[%s] %s blocked by ML (%.1f%%)", strategy.id, side.value, ml_conf * 100)
-            else:
-                trade = open_trade(strategy, candles, confirm_idx, series, snap)
-                if trade is not None:
-                    st["active_trade"] = trade.to_dict()
-                    res["active_trade"] = st["active_trade"]
-                    res["new_entry"] = {"side": trade.side, "entry": trade.entry, "ml_conf": round(ml_conf, 4)}
-                    payload, text = notifier.entry_alert(trade, strategy, ml_conf, adx=series["adx"][confirm_idx])
-                    notifier.deliver(payload, text)
-                    log.info("[%s] NEW %s @ %s  ml=%.1f%%", strategy.id, trade.side.upper(),
-                             notifier.fmt(trade.entry), ml_conf * 100)
-        st["last_signal_bar"] = candles[confirm_idx][T]
+    fresh_bar = confirm_idx >= WARMUP_BARS and candles[confirm_idx][T] > st["last_signal_bar"]
+    if st["active_trade"] is None and fresh_bar:
+        _maybe_enter(strategy, st, candles, series, state, gs, res, trained_model, funding)
 
     mlst = st["ml"]
     if mlst.get("total_trades", 0) > 0:
+        v2 = ml.summary(mlst, strategy.id)
         ml_summary[strategy.id] = {
             "total_trades": mlst["total_trades"], "wins": mlst["wins"],
             "wr": mlst["wins"] / mlst["total_trades"],
-            "conf": ml.laplace(mlst["wins"], mlst["total_trades"] - mlst["wins"]),
+            "conf": v2["p_win"],           # calibrated-prior P(win), replaces raw laplace
+            "v2": v2,
         }
     results.append(res)
 
 
+# ── the poll ─────────────────────────────────────────────────────────────────
+def _fetch_pairs(pairs: List[Pair]) -> Tuple[Dict[Pair, List], Dict[Pair, Dict]]:
+    pair_candles: Dict[Pair, List] = {}
+    pair_series: Dict[Pair, Dict] = {}
+    for pair in pairs:
+        try:
+            candles = market.fetch_klines(pair[0], pair[1], limit=KLINE_LIMIT)
+            pair_candles[pair] = candles
+            pair_series[pair] = compute_series(candles)
+        except Exception as err:  # noqa: BLE001 — one dead feed must not sink the poll
+            log.error("fetch %s %s failed: %s", pair[0], pair[1], err)
+    return pair_candles, pair_series
+
+
 def run_one_poll() -> Dict[str, Any]:
+    started = time.monotonic()
     state = load_state()
     gs = ensure_global(state)
     trained_model = load_trained_model()
 
-    pair_candles: Dict[tuple, List] = {}
-    pair_series: Dict[tuple, Dict] = {}
-    for pair in active_pairs():
-        try:
-            candles = market.fetch_klines(pair[0], pair[1], limit=720)
-            pair_candles[pair] = candles
-            pair_series[pair] = compute_series(candles)
-        except Exception as err:  # noqa: BLE001
-            log.error("fetch %s %s failed: %s", pair[0], pair[1], err)
+    # Context BEFORE trading: it feeds the funding-pause gate. Outage → gate off.
+    try:
+        market_ctx = context.fetch_market_context()
+    except Exception as err:  # noqa: BLE001
+        log.warning("market context unavailable (funding gate off this poll): %s", err)
+        market_ctx = {}
+
+    pair_candles, pair_series = _fetch_pairs(active_pairs())
 
     results: List[Dict[str, Any]] = []
     ml_summary: Dict[str, Any] = {}
@@ -171,20 +278,17 @@ def run_one_poll() -> Dict[str, Any]:
             results.append({"strategy": strategy.id, "asset": strategy.asset, "tf": strategy.timeframe,
                             "error": "data unavailable", "events": [], "price_24h": []})
             continue
+        funding = market_ctx.get(f"{strategy.asset.lower()}_funding")
         try:
-            process_strategy(strategy, candles, series, state, gs, results, ml_summary)
+            process_strategy(strategy, candles, series, state, gs, results, ml_summary,
+                             trained_model, funding)
         except Exception as err:  # noqa: BLE001 — one bad strategy must not sink the poll
             log.exception("strategy %s errored: %s", strategy.id, err)
 
     # Persist trade-lifecycle state NOW — it must never depend on the best-effort
-    # enrichment below succeeding (a Binance hiccup must not roll back real trades).
+    # enrichment below succeeding (a whale-flow hiccup must not roll back trades).
     save_state(state)
 
-    try:
-        market_ctx = context.fetch_market_context()
-    except Exception as err:  # noqa: BLE001
-        log.warning("market context unavailable: %s", err)
-        market_ctx = {}
     try:
         whale_ctx = whale.fetch_whale_flow()
     except Exception as err:  # noqa: BLE001
@@ -201,7 +305,10 @@ def run_one_poll() -> Dict[str, Any]:
         ml_conf = (ml_summary.get(r["strategy"]) or {}).get("conf")
         whale_sig = (whale_ctx.get("net_signal") or {}).get(asset)
         funding = market_ctx.get(f"{asset.lower()}_funding")
-        trained_prob = ml.apply_trained_model(trained_model, candles, len(candles) - 2, asset) if candles else None
+        try:
+            trained_prob = ml.apply_trained_model(trained_model, candles, len(candles) - 2, asset) if candles else None
+        except Exception:  # noqa: BLE001 — advisory input; a corrupt model must not sink the blob
+            trained_prob = None
         verdicts[r["strategy"]] = intelligence.compute_trade_verdict(
             asset, ml_conf, whale_sig, funding, None, hour, trained_prob
         )
@@ -212,6 +319,12 @@ def run_one_poll() -> Dict[str, Any]:
 
     blob = _build_blob(results, ml_summary, market_ctx, whale_ctx, strat_stats, verdicts,
                        weekly, correlation, trained_model, gs)
+    opened = sum(1 for r in results if r.get("new_entry"))
+    closed = sum(1 for r in results if r.get("trade_closed"))
+    blocked = sum(1 for r in results if r.get("blocked_by"))
+    errors = sum(1 for r in results if r.get("error"))
+    log.info("Poll done in %.1fs — %d opened · %d closed · %d blocked · %d feed errors",
+             time.monotonic() - started, opened, closed, blocked, errors)
     if config.OUTPUT_JSON:
         sys.stdout.write("<<<MINDSHOT_JSON>>>")
         sys.stdout.write(json.dumps(blob))

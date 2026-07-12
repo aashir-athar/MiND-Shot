@@ -1,304 +1,393 @@
 #!/usr/bin/env python3
 """
-MiND-Shot ML Trainer — Walk-Forward Logistic Regression
-─────────────────────────────────────────────────────────────────
-Trains a binary classifier (direction up vs down over next K bars)
-on years of BTC/ETH OHLCV data from Kraken's free public API.
+MiND-Shot ML Trainer v2 — walk-forward directional model (pure stdlib).
 
-Approach: walk-forward cross validation.
-   - Train on the first 70% of historical data
-   - Test on the remaining 30% (out-of-sample, never seen during training)
-   - Report HONEST out-of-sample accuracy
+Trains the weekly "trained" expert: a logistic regression predicting direction
+(up vs down over the next 4 bars) on 4h BTC/ETH candles. The engine applies it
+via ``mind_shot.ml.apply_trained_model`` with the exact same 12 features, and
+the online ensemble weighs it against the other experts by its live log-loss.
 
-Features engineered (pure stdlib, no numpy/sklearn needed):
-   - Returns: 1-bar, 3-bar, 6-bar, 12-bar
-   - RSI(14)
-   - ATR(14) / price (volatility regime)
-   - EMA-fast / EMA-slow ratio (trend)
-   - Volume Z-score (vs 20-bar mean)
-   - Hour-of-day (cyclic encoding for daily-period markets)
-   - Distance from 50-bar high (mean-reversion signal)
-   - Distance from 50-bar low
+What v2 fixes over v1 (which trained on a single 70/30 split of at most 720
+Kraken bars and once shipped an ETH model at 47% out-of-sample — worse than a
+coin flip):
 
-Trains with online SGD logistic regression + L2 regularization.
-Reports realistic 52-62% out-of-sample directional accuracy.
-This is REAL trained ML, not a marketing number.
+  • Data — merges the committed 4h fixtures (the playbook window) with live
+    Kraken history, deduplicated by timestamp: several times more bars.
+  • Validation — expanding-window walk-forward cross-validation (K chronological
+    folds, train on everything before each fold, test on the fold), reporting
+    mean out-of-sample accuracy / log-loss / Brier — not one lucky split.
+  • Optimisation — mini-batch SGD with momentum, learning-rate decay, proper
+    seeded shuffling, and early stopping on a validation tail.
+  • Champion/challenger — the new weights are PUBLISHED only if their mean
+    walk-forward log-loss beats the naive base-rate baseline; otherwise the
+    previous published weights are kept and the failed attempt is recorded.
+    A model worse than "always predict the base rate" never ships.
+  • Persistence — merges into ``state/trained_model.json`` (never wipes other
+    keys) and appends a capped metrics history for auditability.
 """
-import sys, os, json, math, urllib.request
-from collections import deque
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import sys
+import tempfile
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from mind_shot import config, indicators as ind
+from mind_shot.backtest import _load_fixture
 
 try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-except Exception: pass
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
 
-ENGINE_DIR = Path(__file__).resolve().parent
-if ENGINE_DIR.name == 'engine':
-    STATE_DIR = ENGINE_DIR.parent / 'state'      # Electron layout
-else:
-    STATE_DIR = ENGINE_DIR / 'state'             # GitHub layout
-MODEL_FILE = STATE_DIR / 'trained_model.json'
+MODEL_FILE = config.TRAINED_MODEL_FILE
+FEATURES_V = 1                # must match mind_shot.ml.apply_trained_model exactly
+HORIZON_BARS = 4
+N_FOLDS = 5
+SEED = 42
+HISTORY_CAP = 24
 
-# ── Fetch maximum daily history from Kraken ──
-def fetch_history(asset_pair, interval=60):
-    """Fetch as much hourly history as Kraken allows (720 candles = 30 days @ 1h)."""
-    url = f"https://api.kraken.com/0/public/OHLC?pair={asset_pair}&interval={interval}"
-    req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+KRAKEN_PAIR = {"BTC": "XBTUSDT", "ETH": "ETHUSDT"}
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+# ── data ─────────────────────────────────────────────────────────────────────
+def fetch_kraken(pair: str, interval: int = 240) -> List[Tuple]:
+    """Most recent ~720 bars from Kraken's public OHLC endpoint (best effort)."""
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
         d = json.loads(r.read().decode())
-    if d.get('error'): raise RuntimeError(f"Kraken: {d['error']}")
-    res = d['result']
-    pair_key = next(k for k in res if k != 'last')
-    rows = res[pair_key]
-    return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]),
-             float(r[4]), float(r[6])) for r in rows]
+    if d.get("error"):
+        raise RuntimeError(f"Kraken: {d['error']}")
+    res = d["result"]
+    key = next(k for k in res if k != "last")
+    return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6]))
+            for r in res[key]]
 
-# ── Indicator helpers (pure Python) ──
-def ema(src, length):
-    out = [None] * len(src)
-    if not src: return out
-    k = 2.0 / (length + 1)
-    out[0] = src[0]
-    for i in range(1, len(src)):
-        out[i] = src[i] * k + out[i-1] * (1-k)
-    return out
 
-def wilder_atr(highs, lows, closes, length):
-    n = len(closes); out = [None] * n
-    if n < 2: return out
-    trs = [None]*n; trs[0] = highs[0]-lows[0]
-    for i in range(1, n):
-        h, l, pc = highs[i], lows[i], closes[i-1]
-        trs[i] = max(h-l, abs(h-pc), abs(l-pc))
-    if n <= length: return out
-    seed = sum(trs[1:length+1]) / length; out[length] = seed
-    for i in range(length+1, n): out[i] = (out[i-1]*(length-1) + trs[i]) / length
-    return out
+def load_candles(asset: str) -> Tuple[List[Tuple], Dict[str, Any]]:
+    """Committed fixtures + live Kraken, merged and deduplicated by timestamp.
 
-def rsi(closes, length=14):
-    n = len(closes); out = [None] * n
-    if n <= length: return out
-    gains = [0.0]*n; losses = [0.0]*n
-    for i in range(1, n):
-        d = closes[i] - closes[i-1]
-        gains[i]  = d if d > 0 else 0
-        losses[i] = -d if d < 0 else 0
-    ag = sum(gains[1:length+1])/length; al = sum(losses[1:length+1])/length
-    out[length] = 100 - 100/(1 + ag/al) if al > 0 else 100
-    for i in range(length+1, n):
-        ag = (ag*(length-1) + gains[i]) / length
-        al = (al*(length-1) + losses[i]) / length
-        out[i] = 100 - 100/(1 + ag/al) if al > 0 else 100
-    return out
+    Kraken's final row is the still-forming candle — it is dropped so no label
+    is ever computed from an unfinished bar. Merge seams (fixture→live venue
+    switch, or a widening gap once the 720-bar Kraken window drifts past the
+    fixture end) are detected and logged so a silent data hole can't masquerade
+    as a clean training set."""
+    candles = {c[0]: c for c in _load_fixture(asset)}
+    n_fix = len(candles)
+    n_live = 0
+    try:
+        live = fetch_kraken(KRAKEN_PAIR[asset])[:-1]     # drop the forming candle
+        for c in live:
+            candles[c[0]] = c
+        n_live = len(live)
+    except Exception as err:  # noqa: BLE001 — offline/CI runs train on fixtures alone
+        log(f"  Kraken unavailable ({err}) — training on fixtures only")
+    merged = [candles[t] for t in sorted(candles)]
+    gaps = sum(1 for a, b in zip(merged, merged[1:]) if b[0] - a[0] > 2 * 4 * 3600)
+    if gaps:
+        log(f"  WARNING: {gaps} gap(s) > 8h in the merged {asset} series — "
+            f"indicator windows spanning a gap are noisier")
+    span_days = (merged[-1][0] - merged[0][0]) / 86400 if merged else 0
+    return merged, {"fixture_bars": n_fix, "live_bars": n_live,
+                    "merged_bars": len(merged), "span_days": round(span_days), "gaps_gt_8h": gaps}
 
-def sma(src, length):
-    n = len(src); out = [None] * n
-    if n < length: return out
-    s = sum(src[:length]); out[length-1] = s/length
-    for i in range(length, n):
-        s += src[i] - src[i-length]
-        out[i] = s/length
-    return out
 
-def stdev(src, length):
-    n = len(src); out = [None] * n
-    if n < length: return out
-    for i in range(length-1, n):
-        window = src[i-length+1:i+1]
-        m = sum(window) / length
-        var = sum((x-m)**2 for x in window) / length
-        out[i] = math.sqrt(max(var, 0))
-    return out
-
-# ── Feature engineering ──
-def build_features(candles, horizon_bars=4):
-    """Returns (X, y) — X is list of feature vectors, y is binary labels (1=up, 0=down)."""
+# ── features (identical to mind_shot.ml.apply_trained_model) ─────────────────
+def build_features(candles: Sequence[Tuple], horizon_bars: int = HORIZON_BARS) -> Tuple[List[List[float]], List[int]]:
     n = len(candles)
-    if n < 100: return [], []
+    if n < 100:
+        return [], []
     closes = [c[4] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    vols   = [c[5] for c in candles]
-    times  = [c[0] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    vols = [c[5] for c in candles]
+    times = [c[0] for c in candles]
 
-    atr  = wilder_atr(highs, lows, closes, 14)
-    rsi_ = rsi(closes, 14)
-    eF   = ema(closes, 12)
-    eS   = ema(closes, 26)
-    vSMA = sma(vols, 20)
-    vSTD = stdev(vols, 20)
-    h50  = sma(highs, 50)   # used as ceiling proxy
-    l50  = sma(lows,  50)
+    atr = ind.atr(highs, lows, closes, 14)
+    rsi14 = ind.rsi(closes, 14)
+    ema_f = ind.ema(closes, 12)
+    ema_s = ind.ema(closes, 26)
+    v_sma = ind.sma(vols, 20)
+    v_std = ind.rolling_std(vols, 20, ddof=0)
+    h50 = ind.sma(highs, 50)
+    l50 = ind.sma(lows, 50)
 
-    X, y = [], []
-    start = 50
-    end   = n - horizon_bars   # need 'horizon_bars' future bars to label
-    for i in range(start, end):
-        if any(x[i] is None for x in (atr, rsi_, eF, eS, vSMA, vSTD, h50, l50)):
+    X: List[List[float]] = []
+    y: List[int] = []
+    for i in range(50, n - horizon_bars):
+        if any(a[i] is None for a in (atr, rsi14, ema_f, ema_s, v_sma, v_std, h50, l50)):
             continue
-        if closes[i] <= 0 or vSMA[i] <= 0 or vSTD[i] <= 0:
+        if closes[i] <= 0 or v_sma[i] <= 0 or v_std[i] <= 0 or ema_s[i] == 0:
             continue
-        # ── Features ──
-        ret_1  = (closes[i]/closes[i-1] - 1) * 100
-        ret_3  = (closes[i]/closes[i-3] - 1) * 100
-        ret_6  = (closes[i]/closes[i-6] - 1) * 100
-        ret_12 = (closes[i]/closes[i-12] - 1) * 100
-        rsi_v  = (rsi_[i] - 50) / 50                       # [-1, 1]
-        atr_p  = atr[i] / closes[i] * 100                  # ATR as % of price
-        ema_r  = (eF[i] - eS[i]) / eS[i] * 100             # EMA ratio %
-        vol_z  = (vols[i] - vSMA[i]) / vSTD[i]             # volume z-score
-        hr     = datetime.fromtimestamp(times[i], tz=timezone.utc).hour
-        hr_sin = math.sin(2 * math.pi * hr / 24)
-        hr_cos = math.cos(2 * math.pi * hr / 24)
-        dist_h = (closes[i] - h50[i]) / closes[i] * 100    # negative = below 50-MA ceiling
-        dist_l = (closes[i] - l50[i]) / closes[i] * 100    # positive = above floor
-
-        x = [ret_1, ret_3, ret_6, ret_12, rsi_v, atr_p, ema_r, vol_z, hr_sin, hr_cos, dist_h, dist_l]
-        # ── Label: did price go UP over next horizon_bars? ──
-        future_close = closes[i + horizon_bars]
-        label = 1 if future_close > closes[i] else 0
-        X.append(x); y.append(label)
+        hr = datetime.fromtimestamp(times[i], tz=timezone.utc).hour
+        X.append([
+            (closes[i] / closes[i - 1] - 1) * 100,
+            (closes[i] / closes[i - 3] - 1) * 100,
+            (closes[i] / closes[i - 6] - 1) * 100,
+            (closes[i] / closes[i - 12] - 1) * 100,
+            (rsi14[i] - 50) / 50,
+            atr[i] / closes[i] * 100,
+            (ema_f[i] - ema_s[i]) / ema_s[i] * 100,
+            (vols[i] - v_sma[i]) / v_std[i],
+            math.sin(2 * math.pi * hr / 24),
+            math.cos(2 * math.pi * hr / 24),
+            (closes[i] - h50[i]) / closes[i] * 100,
+            (closes[i] - l50[i]) / closes[i] * 100,
+        ])
+        y.append(1 if closes[i + horizon_bars] > closes[i] else 0)
     return X, y
 
-# ── Online logistic regression (pure Python, no numpy needed) ──
-def sigmoid(z):
-    if z > 30:  return 1.0
-    if z < -30: return 0.0
+
+# ── logistic regression (mini-batch SGD, momentum, early stopping) ───────────
+def sigmoid(z: float) -> float:
+    if z > 30:
+        return 1.0
+    if z < -30:
+        return 0.0
     return 1.0 / (1.0 + math.exp(-z))
 
-def standardize(X):
-    """Returns (X_std, means, stds) — feature standardization."""
-    n_features = len(X[0])
-    means = [sum(row[j] for row in X) / len(X) for j in range(n_features)]
-    stds  = [math.sqrt(sum((row[j]-means[j])**2 for row in X) / len(X)) or 1.0 for j in range(n_features)]
-    X_std = [[(row[j] - means[j]) / stds[j] for j in range(n_features)] for row in X]
-    return X_std, means, stds
 
-def train_logistic(X, y, epochs=30, lr=0.05, l2=0.001):
-    """Train binary logistic regression with online SGD + L2."""
-    if not X: return None, None
-    n_features = len(X[0])
-    w = [0.0] * n_features
-    b = 0.0
+def standardize_fit(X: List[List[float]]) -> Tuple[List[float], List[float]]:
+    k = len(X[0])
+    means = [sum(r[j] for r in X) / len(X) for j in range(k)]
+    stds = [math.sqrt(sum((r[j] - means[j]) ** 2 for r in X) / len(X)) or 1.0 for j in range(k)]
+    return means, stds
+
+
+def standardize_apply(X: List[List[float]], means: List[float], stds: List[float]) -> List[List[float]]:
+    return [[(r[j] - means[j]) / stds[j] for j in range(len(r))] for r in X]
+
+
+def logloss_of(probs: List[float], y: List[int]) -> float:
+    return sum(-math.log(min(max(p if t else 1 - p, 1e-9), 1.0)) for p, t in zip(probs, y)) / max(len(y), 1)
+
+
+def train_logistic(
+    X: List[List[float]], y: List[int], *,
+    epochs: int = 80, lr0: float = 0.08, l2: float = 1e-3,
+    momentum: float = 0.9, batch: int = 32, patience: int = 8, seed: int = SEED,
+) -> Tuple[List[float], float]:
+    """Mini-batch SGD with momentum + lr decay, early-stopped on a chronological
+    validation tail (last 15% of the training window — never future data)."""
+    k = len(X[0])
+    split = max(int(len(X) * 0.85), 1)
+    # Purge the label horizon at the boundary: the last HORIZON_BARS training
+    # labels are computed from closes INSIDE the validation window.
+    purged = max(split - HORIZON_BARS, 1)
+    Xt, yt, Xv, yv = X[:purged], y[:purged], X[split:], y[split:]
+    base = sum(yt) / len(yt) if yt else 0.5
+    w = [0.0] * k
+    b = math.log(max(base, 1e-6) / max(1 - base, 1e-6))   # warm-start at base rate
+    vw = [0.0] * k
+    vb = 0.0
+    rng = random.Random(seed)
+    best = (float("inf"), list(w), b)
+    stale = 0
+    idx = list(range(len(Xt)))
     for epoch in range(epochs):
-        # Shuffle indices (using index list, deterministic via epoch seed)
-        order = list(range(len(X)))
-        # Pseudo-shuffle without random module dependency on seed
-        for i in range(len(order)):
-            j = (i * 9301 + epoch * 49297) % len(order)
-            order[i], order[j] = order[j], order[i]
-        for idx in order:
-            x = X[idx]; target = y[idx]
-            z = sum(w[j]*x[j] for j in range(n_features)) + b
-            pred = sigmoid(z)
-            err = target - pred
-            for j in range(n_features):
-                w[j] += lr * (err * x[j] - l2 * w[j])
-            b += lr * err
-    return w, b
+        rng.shuffle(idx)
+        lr = lr0 / (1.0 + 0.05 * epoch)
+        for s in range(0, len(idx), batch):
+            gws = [0.0] * k
+            gb = 0.0
+            chunk = idx[s:s + batch]
+            for i in chunk:
+                p = sigmoid(sum(w[j] * Xt[i][j] for j in range(k)) + b)
+                e = p - yt[i]
+                for j in range(k):
+                    gws[j] += e * Xt[i][j]
+                gb += e
+            m = len(chunk)
+            for j in range(k):
+                vw[j] = momentum * vw[j] - lr * (gws[j] / m + l2 * w[j])
+                w[j] += vw[j]
+            vb = momentum * vb - lr * (gb / m)
+            b += vb
+        if Xv:
+            val = logloss_of([sigmoid(sum(w[j] * r[j] for j in range(k)) + b) for r in Xv], yv)
+            if val < best[0] - 1e-5:
+                best = (val, list(w), b)
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+    return (best[1], best[2]) if Xv else (w, b)
 
-def predict_batch(X, w, b):
-    """Returns list of probabilities (0..1)."""
-    n_features = len(X[0])
-    out = []
-    for x in X:
-        z = sum(w[j]*x[j] for j in range(n_features)) + b
-        out.append(sigmoid(z))
-    return out
 
-def evaluate(probs, y):
-    """Returns accuracy at 0.5 threshold."""
-    correct = 0
-    for p, t in zip(probs, y):
-        pred = 1 if p >= 0.5 else 0
-        if pred == t: correct += 1
-    return correct / len(y) * 100 if y else 0.0
+def predict_batch(X: List[List[float]], w: List[float], b: float) -> List[float]:
+    k = len(w)
+    return [sigmoid(sum(w[j] * r[j] for j in range(k)) + b) for r in X]
 
-# ── Walk-forward training for one asset ──
-def train_pair(asset_pair, asset_name):
-    print(f"\n── Training {asset_name} ──", file=sys.stderr)
-    # Train on 4h bars to match the timeframe the engine applies the model on.
-    candles = fetch_history(asset_pair, interval=240)
-    print(f"  Fetched {len(candles)} 4h candles ({(candles[-1][0]-candles[0][0])/86400:.0f} days)", file=sys.stderr)
-    X, y = build_features(candles, horizon_bars=4)
-    if len(X) < 100:
-        print(f"  Not enough samples after feature engineering: {len(X)}", file=sys.stderr)
+
+# ── walk-forward evaluation ──────────────────────────────────────────────────
+def walk_forward(X: List[List[float]], y: List[int]) -> List[Dict[str, float]]:
+    """Expanding-window CV: K chronological folds, train strictly on the past."""
+    n = len(X)
+    block = n // (N_FOLDS + 1)
+    folds = []
+    for f in range(1, N_FOLDS + 1):
+        tr_end = block * f
+        te_end = min(block * (f + 1), n)
+        # Purge the label horizon: the last HORIZON_BARS train labels are
+        # computed from closes inside the test fold — drop them (embargo).
+        Xtr, ytr = X[:tr_end - HORIZON_BARS], y[:tr_end - HORIZON_BARS]
+        Xte, yte = X[tr_end:te_end], y[tr_end:te_end]
+        if len(Xtr) < 80 or len(Xte) < 20:
+            continue
+        means, stds = standardize_fit(Xtr)
+        w, b = train_logistic(standardize_apply(Xtr, means, stds), ytr, seed=SEED + f)
+        probs = predict_batch(standardize_apply(Xte, means, stds), w, b)
+        base = sum(ytr) / len(ytr)
+        acc = sum(1 for p, t in zip(probs, yte) if (p >= 0.5) == bool(t)) / len(yte)
+        base_acc = max(sum(yte), len(yte) - sum(yte)) / len(yte)
+        folds.append({
+            "train": len(Xtr), "test": len(Xte),
+            "acc": round(acc * 100, 2),
+            "logloss": round(logloss_of(probs, yte), 4),
+            "brier": round(sum((p - t) ** 2 for p, t in zip(probs, yte)) / len(yte), 4),
+            "baseline_acc": round(base_acc * 100, 2),
+            "baseline_logloss": round(logloss_of([base] * len(yte), yte), 4),
+        })
+    return folds
+
+
+def train_asset(asset: str) -> Optional[Dict[str, Any]]:
+    log(f"\n-- Training {asset} --")
+    candles, data_info = load_candles(asset)
+    log(f"  Data: {data_info['merged_bars']} bars over {data_info['span_days']} days "
+        f"({data_info['fixture_bars']} fixture + {data_info['live_bars']} live)")
+    X, y = build_features(candles)
+    if len(X) < 200:
+        log(f"  Not enough samples: {len(X)}")
         return None
-    print(f"  Built {len(X)} (feature, label) samples", file=sys.stderr)
+    folds = walk_forward(X, y)
+    if not folds:
+        log("  Walk-forward produced no valid folds")
+        return None
+    mean = lambda k: sum(f[k] for f in folds) / len(folds)  # noqa: E731
+    oos_acc, oos_ll, oos_br = mean("acc"), mean("logloss"), mean("brier")
+    base_acc, base_ll = mean("baseline_acc"), mean("baseline_logloss")
+    log(f"  Walk-forward ({len(folds)} folds): acc {oos_acc:.2f}% (base {base_acc:.2f}%) · "
+        f"logloss {oos_ll:.4f} (base {base_ll:.4f}) · brier {oos_br:.4f}")
 
-    # Train/test split: 70/30 walk-forward (no shuffle — chronological)
-    split = int(len(X) * 0.7)
-    X_train, y_train = X[:split], y[:split]
-    X_test,  y_test  = X[split:], y[split:]
+    beats_baseline = oos_ll < base_ll
+    log(f"  Challenger {'BEATS' if beats_baseline else 'DOES NOT BEAT'} the base-rate baseline")
 
-    # Standardize using TRAIN stats only (avoid look-ahead)
-    X_train_std, means, stds = standardize(X_train)
-    X_test_std = [[(row[j] - means[j]) / stds[j] for j in range(len(row))] for row in X_test]
-
-    # Train logistic regression
-    w, b = train_logistic(X_train_std, y_train, epochs=30, lr=0.05, l2=0.001)
-
-    # In-sample accuracy
-    train_probs = predict_batch(X_train_std, w, b)
-    train_acc   = evaluate(train_probs, y_train)
-    # Out-of-sample accuracy (the honest number)
-    test_probs  = predict_batch(X_test_std, w, b)
-    test_acc    = evaluate(test_probs, y_test)
-    # Baseline = always predict majority class
-    pos_rate    = sum(y_test) / len(y_test) * 100 if y_test else 50
-    baseline    = max(pos_rate, 100 - pos_rate)
-
-    print(f"  Train samples: {len(X_train)} · Test samples: {len(X_test)}", file=sys.stderr)
-    print(f"  In-sample accuracy:  {train_acc:.2f}%", file=sys.stderr)
-    print(f"  Out-of-sample (HONEST): {test_acc:.2f}%", file=sys.stderr)
-    print(f"  Naive baseline (majority class): {baseline:.2f}%", file=sys.stderr)
-    print(f"  Edge over baseline: {test_acc - baseline:+.2f}%", file=sys.stderr)
-
+    # final weights: fit on all data (validation numbers above stay the honest report)
+    means, stds = standardize_fit(X)
+    w, b = train_logistic(standardize_apply(X, means, stds), y)
     return {
-        'weights': w, 'bias': b, 'means': means, 'stds': stds,
-        'train_samples': len(X_train), 'test_samples': len(X_test),
-        'train_acc': round(train_acc, 2),
-        'oos_acc':   round(test_acc, 2),
-        'baseline':  round(baseline, 2),
-        'edge':      round(test_acc - baseline, 2),
-        'horizon_bars': 4,
+        "weights": w, "bias": b, "means": means, "stds": stds,
+        "train_samples": len(X), "horizon_bars": HORIZON_BARS, "features_v": FEATURES_V,
+        "folds": folds,
+        "oos_acc": round(oos_acc, 2), "oos_logloss": round(oos_ll, 4), "oos_brier": round(oos_br, 4),
+        "baseline_acc": round(base_acc, 2), "baseline_logloss": round(base_ll, 4),
+        "edge": round(oos_acc - base_acc, 2),
+        "beats_baseline": beats_baseline,
+        "data": data_info,
     }
 
-def main():
-    print('MiND-Shot ML Trainer · walk-forward logistic regression on Kraken hourly data')
-    print('Honesty mandate: 100% accuracy does not exist · 52-62% OOS = profitable when combined with universal SL ratchet')
-    print()
-    STATE_DIR.mkdir(exist_ok=True)
 
-    result = {'trained_at': datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-    try:
-        btc = train_pair('XBTUSDT', 'BTC')
-        if btc:
-            result['btc'] = btc
-            result['btc_oos_wr']  = btc['oos_acc']
-            result['btc_samples'] = btc['train_samples']
-    except Exception as e:
-        print(f"BTC training failed: {e}", file=sys.stderr)
+def main() -> None:
+    log("MiND-Shot ML Trainer v2 - expanding-window walk-forward logistic on 4h data")
+    log("Honesty mandate: metrics below are out-of-sample means, and a challenger that")
+    log("cannot beat the base-rate baseline is recorded but NOT published.")
+    MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        eth = train_pair('ETHUSDT', 'ETH')
-        if eth:
-            result['eth'] = eth
-            result['eth_oos_wr']  = eth['oos_acc']
-            result['eth_samples'] = eth['train_samples']
-    except Exception as e:
-        print(f"ETH training failed: {e}", file=sys.stderr)
+    previous: Dict[str, Any] = {}
+    if MODEL_FILE.exists():
+        try:
+            previous = json.loads(MODEL_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
 
-    # Persist trained model
-    MODEL_FILE.write_text(json.dumps(result, indent=2))
-    print(f"\nModel saved to {MODEL_FILE}", file=sys.stderr)
+    result = dict(previous)  # merge, never wipe
+    result["trained_at"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    result["trainer_version"] = 2
+    history = result.get("history") or []
+    run_record: Dict[str, Any] = {"at": result["trained_at"]}
 
-    # Emit structured JSON for Electron to parse
-    sys.stdout.write('<<<MINDSHOT_TRAINING>>>')
-    sys.stdout.write(json.dumps({'ok': True, 'stats': result}))
-    sys.stdout.write('<<</MINDSHOT_TRAINING>>>\n')
+    for asset in ("BTC", "ETH"):
+        key = asset.lower()
+        try:
+            challenger = train_asset(asset)
+        except Exception as err:  # noqa: BLE001
+            log(f"{asset} training failed: {err}")
+            run_record[key] = {"error": str(err)}
+            continue
+        if challenger is None:
+            run_record[key] = {"error": "insufficient data"}
+            continue
+        run_record[key] = {k: challenger[k] for k in
+                           ("oos_acc", "oos_logloss", "baseline_logloss", "edge", "beats_baseline", "train_samples")}
+        incumbent = previous.get(key) if isinstance(previous.get(key), dict) else None
+        if challenger["beats_baseline"]:
+            challenger["published"] = True
+            result[key] = challenger
+            log(f"  {asset}: published new weights")
+        elif incumbent and incumbent.get("weights") and incumbent.get("beats_baseline"):
+            # Keep a champion only if IT proved its own edge (v2 discipline). The
+            # rejected challenger's numbers are recorded, never served as champion's.
+            incumbent["challenger_rejected"] = run_record[key]
+            result[key] = incumbent
+            log(f"  {asset}: challenger rejected - keeping the proven incumbent")
+        else:
+            # No model — incumbent either doesn't exist or never proved an edge
+            # (e.g. the v1 single-split model). Serving nothing is the honest
+            # move: the engine's trained expert simply sleeps.
+            retired = {k: v for k, v in (incumbent or {}).items()
+                       if k not in ("weights", "bias", "means", "stds")}
+            retired.update({"published": False,
+                            "retired_reason": "no model beats the base-rate baseline",
+                            "last_challenger": run_record[key]})
+            result[key] = retired
+            log(f"  {asset}: NO model published - nothing beats the base-rate baseline")
+        served = result[key]
+        # Engine-blob back-compat keys always describe the SERVED model (or None).
+        result[f"{key}_oos_wr"] = served.get("oos_acc") if served.get("weights") else None
+        result[f"{key}_samples"] = served.get("train_samples") if served.get("weights") else None
+
+    history.append(run_record)
+    result["history"] = history[-HISTORY_CAP:]
+    _atomic_write(MODEL_FILE, json.dumps(result, indent=2))
+    log(f"\nModel saved to {MODEL_FILE}")
+
+    sys.stdout.write("<<<MINDSHOT_TRAINING>>>")
+    sys.stdout.write(json.dumps({"ok": True, "stats": result}, default=str))
+    sys.stdout.write("<<</MINDSHOT_TRAINING>>>\n")
     sys.stdout.flush()
 
-if __name__ == '__main__': main()
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via temp file + rename — a crash mid-write must never wipe the
+    champion weights or the training history (append-only policy)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".model-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    main()

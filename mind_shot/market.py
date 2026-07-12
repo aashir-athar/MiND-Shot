@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.request
@@ -65,8 +66,23 @@ def fetch_klines(asset: str, interval: str, limit: int = 720) -> List[Candle]:
     if pair_key is None:
         raise RuntimeError("Kraken returned no OHLC series")
     rows = result.get(pair_key, [])[-limit:]
-    # Kraken row: [time_s, open, high, low, close, vwap, volume, count]
-    return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6])) for r in rows]
+    # Kraken row: [time_s, open, high, low, close, vwap, volume, count].
+    # Validate before feeding indicator math: strictly-increasing timestamps,
+    # finite values, positive close — one malformed row must not poison a poll.
+    candles: List[Candle] = []
+    last_t = 0
+    for r in rows:
+        try:
+            c = (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if c[0] <= last_t or c[4] <= 0 or not all(math.isfinite(v) for v in c[1:]):
+            continue
+        candles.append(c)
+        last_t = c[0]
+    if len(candles) < 10:
+        raise RuntimeError(f"Kraken returned too few valid candles for {asset} ({len(candles)})")
+    return candles
 
 
 __all__ = ["fetch_klines", "PAIRS", "TF_MIN"]

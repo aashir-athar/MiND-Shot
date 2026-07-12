@@ -64,11 +64,11 @@ Dark-first, theme-aware, accessible, colorblind-safe charts — built to match t
 | 🎯 | **5 backtested strategies** | Range-fading mean-reversion (VWAP · RSI-2 · Stochastic · Z-score), ADX-gated, both directions |
 | 📊 | **Live dashboard** | Automated React/GitHub Pages backtest report — equity curves + full trade blotter |
 | 🧪 | **Self-validating** | `python -m mind_shot.backtest` reproduces the documented win rates on live data; CI runs it |
-| 🧠 | **Self-learning ML** | Bayesian buckets + walk-forward logistic model as an advisory second opinion |
+| 🧠 | **Self-learning ML** | Calibrated online ensemble — Bayesian context buckets, FTRL-Proximal logistic, and Hedge expert weighting with drift detection — learning from every closed trade |
 | 🎛 | **Trade Verdict score** | 0–100 score blending ML confidence, whale flow, funding, and session |
 | 🐋 | **Whale-flow signals** | Binance Futures long/short ratio, open interest, taker buy/sell pressure |
 | 🛡️ | **Risk controls** | Daily loss limit, max concurrent trades, post-SL cool-down |
-| 🔁 | **Weekly retrain** | Walk-forward logistic model auto-retrains every Sunday |
+| 🔁 | **Weekly retrain** | Walk-forward-validated challenger retrains every Sunday — published only if it beats the base-rate baseline |
 | 📲 | **Telegram alerts** | Pre-formatted HTML alerts via webhook or direct Bot API |
 
 ## 🎯 The Five Strategies
@@ -101,7 +101,7 @@ These numbers are **in-sample backtests, not promises.** Win rate alone is not e
 | **Dashboard** | React 19 + Vite, deployed to GitHub Pages via Actions |
 | **Market data** | Kraken public OHLC for the live feed (reachable from GitHub Actions; Binance geo-blocks the US runner IPs). The backtest validates against committed Binance 4h fixtures. |
 | **Context** | Binance whale-flow · CoinGecko dominance · alternative.me Fear & Greed |
-| **ML** | Bayesian buckets + walk-forward logistic ensemble |
+| **ML** | Online ensemble (Bayesian buckets · FTRL-Proximal · Hedge weighting · Platt calibration · drift detection) + weekly walk-forward challenger |
 | **Delivery** | Telegram Bot API or Make.com / n8n / Pipedream webhook |
 | **State** | Git-committed JSON (`state/state.json`, `state/trained_model.json`) |
 
@@ -176,7 +176,7 @@ TP / SL / exit events use `type: "event"` with `event: "tp" | "sl" | "exit"`. Al
 
 1. **Data** — every poll fetches recent **Kraken 4h** candles for ETH and BTC (Kraken is reachable from GitHub Actions runners; Binance returns HTTP 451 to their US IPs). The strategies are price-based, so the signals match the backtest.
 2. **Signals** — each strategy checks, on the most recently *closed* bar, whether its oscillator is at an extreme **and** `ADX(14) < 25`. If so it proposes a long or short; the engine acts on the next bar's open.
-3. **Second opinion** — a self-learning **Bayesian ensemble** scores the setup from past outcomes (stop-losses weighted more heavily than wins) and can veto weak signals once a strategy has enough history. A weekly **walk-forward logistic model** adds an independent directional tilt to the Trade Verdict.
+3. **Second opinion** — a self-learning **online ensemble** scores every setup with a calibrated P(win): Bayesian context buckets and an FTRL-Proximal logistic model vote alongside the strategy's own base rate and the weekly directional model, weighted by their realised log-loss (Hedge / multiplicative weights — provably never much worse than the best expert in hindsight). A Page–Hinkley detector accelerates forgetting on regime breaks, and every closed trade updates a prequential honesty ledger (log-loss / Brier / accuracy vs baseline) committed to `state/`. Reproduce the evaluation yourself: `python -m mind_shot.ml_eval`.
 4. **Management** — bracket strategies exit on a fixed take-profit / stop; revert strategies ride back to VWAP or the mean with a hard ATR stop. Stops are checked intrabar, stop-first.
 5. **Delivery & learning** — entries and TP/SL/exit events ship to Telegram; every closed trade updates the ML, the streak heatmap, the journal, and the daily-R stats, all committed back to `state/`.
 
