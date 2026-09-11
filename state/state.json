@@ -2288,13 +2288,13 @@
   "rsi2_bracket_eth": {
     "active_trade": {
       "asset": "ETH",
-      "duration_sec": 0,
+      "duration_sec": 13398,
       "entry": 2559.27,
       "exit_style": "bracket",
       "init_sl": 2626.9623140445574,
       "last_bar": 1789142400,
-      "live_pnl_leveraged": 0.0,
-      "live_pnl_pct": 0.0,
+      "live_pnl_leveraged": 6.22,
+      "live_pnl_pct": 0.622,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -2809,13 +2809,13 @@
   "vwap_bracket_eth": {
     "active_trade": {
       "asset": "ETH",
-      "duration_sec": 0,
+      "duration_sec": 13398,
       "entry": 2559.27,
       "exit_style": "bracket",
       "init_sl": 2626.9623140445574,
       "last_bar": 1789142400,
-      "live_pnl_leveraged": 0.0,
-      "live_pnl_pct": 0.0,
+      "live_pnl_leveraged": 6.22,
+      "live_pnl_pct": 0.622,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -3088,13 +3088,13 @@
   "vwap_revert_eth": {
     "active_trade": {
       "asset": "ETH",
-      "duration_sec": 0,
+      "duration_sec": 13398,
       "entry": 2559.27,
       "exit_style": "revert",
       "init_sl": 2649.5264187260764,
       "last_bar": 1789142400,
-      "live_pnl_leveraged": 0.0,
-      "live_pnl_pct": 0.0,
+      "live_pnl_leveraged": 6.22,
+      "live_pnl_pct": 0.622,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -3367,13 +3367,13 @@
   "zscore_revert_btc": {
     "active_trade": {
       "asset": "BTC",
-      "duration_sec": 162670,
+      "duration_sec": 171798,
       "entry": 78241.7,
       "exit_style": "revert",
       "init_sl": 75964.8660817216,
       "last_bar": 1789128000,
-      "live_pnl_leveraged": -5.65,
-      "live_pnl_pct": -0.565,
+      "live_pnl_leveraged": -12.18,
+      "live_pnl_pct": -1.218,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -3415,7 +3415,7 @@
       "side": "long",
       "sl": 75964.8660817216,
       "strategy_id": "zscore_revert_btc",
-      "target": 78001.98500000003,
+      "target": 77976.43500000003,
       "tf": "4h",
       "tp": null
     },
