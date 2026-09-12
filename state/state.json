@@ -2313,7 +2313,7 @@
   },
   "rsi2_bracket_eth": {
     "active_trade": null,
-    "last_signal_bar": 1789142400,
+    "last_signal_bar": 1789156800,
     "ml": {
       "cal": {
         "a": 0.9756707364764445,
@@ -2545,7 +2545,7 @@
   },
   "stoch_bracket_eth": {
     "active_trade": null,
-    "last_signal_bar": 1789142400,
+    "last_signal_bar": 1789156800,
     "ml": {
       "cal": {
         "a": 1.0321795248048393,
@@ -2781,7 +2781,7 @@
   },
   "vwap_bracket_eth": {
     "active_trade": null,
-    "last_signal_bar": 1789142400,
+    "last_signal_bar": 1789156800,
     "ml": {
       "cal": {
         "a": 0.9914160481697064,
@@ -3008,13 +3008,13 @@
   "vwap_revert_eth": {
     "active_trade": {
       "asset": "ETH",
-      "duration_sec": 21562,
+      "duration_sec": 29260,
       "entry": 2559.27,
       "exit_style": "revert",
       "init_sl": 2649.5264187260764,
-      "last_bar": 1789142400,
-      "live_pnl_leveraged": 17.57,
-      "live_pnl_pct": 1.757,
+      "last_bar": 1789156800,
+      "live_pnl_leveraged": 18.05,
+      "live_pnl_pct": 1.805,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -3056,7 +3056,7 @@
       "side": "short",
       "sl": 2649.5264187260764,
       "strategy_id": "vwap_revert_eth",
-      "target": 2496.961176835925,
+      "target": 2497.610785555927,
       "tf": "4h",
       "tp": null
     },
@@ -3287,13 +3287,13 @@
   "zscore_revert_btc": {
     "active_trade": {
       "asset": "BTC",
-      "duration_sec": 179962,
+      "duration_sec": 187660,
       "entry": 78241.7,
       "exit_style": "revert",
       "init_sl": 75964.8660817216,
-      "last_bar": 1789142400,
-      "live_pnl_leveraged": -14.34,
-      "live_pnl_pct": -1.434,
+      "last_bar": 1789156800,
+      "live_pnl_leveraged": -12.29,
+      "live_pnl_pct": -1.229,
       "ml_snap": {
         "_pred": {
           "experts": {
@@ -3335,7 +3335,7 @@
       "side": "long",
       "sl": 75964.8660817216,
       "strategy_id": "zscore_revert_btc",
-      "target": 77891.28000000003,
+      "target": 77837.42000000001,
       "tf": "4h",
       "tp": null
     },
