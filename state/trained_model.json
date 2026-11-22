@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-11-15 05:13 UTC",
+  "trained_at": "2026-11-22 05:29 UTC",
   "btc": {
     "train_samples": 466,
     "test_samples": 201,
@@ -11,10 +11,10 @@
     "published": false,
     "retired_reason": "no model beats the base-rate baseline",
     "last_challenger": {
-      "oos_acc": 51.2,
-      "oos_logloss": 0.6991,
-      "baseline_logloss": 0.6946,
-      "edge": -0.4,
+      "oos_acc": 51.08,
+      "oos_logloss": 0.6995,
+      "baseline_logloss": 0.6947,
+      "edge": -0.6,
       "beats_baseline": false,
       "train_samples": 14903
     }
@@ -32,10 +32,10 @@
     "published": false,
     "retired_reason": "no model beats the base-rate baseline",
     "last_challenger": {
-      "oos_acc": 50.98,
-      "oos_logloss": 0.7021,
-      "baseline_logloss": 0.6944,
-      "edge": -0.76,
+      "oos_acc": 50.92,
+      "oos_logloss": 0.7023,
+      "baseline_logloss": 0.6945,
+      "edge": -0.9,
       "beats_baseline": false,
       "train_samples": 14903
     }
@@ -401,6 +401,25 @@
         "oos_logloss": 0.7021,
         "baseline_logloss": 0.6944,
         "edge": -0.76,
+        "beats_baseline": false,
+        "train_samples": 14903
+      }
+    },
+    {
+      "at": "2026-11-22 05:29 UTC",
+      "btc": {
+        "oos_acc": 51.08,
+        "oos_logloss": 0.6995,
+        "baseline_logloss": 0.6947,
+        "edge": -0.6,
+        "beats_baseline": false,
+        "train_samples": 14903
+      },
+      "eth": {
+        "oos_acc": 50.92,
+        "oos_logloss": 0.7023,
+        "baseline_logloss": 0.6945,
+        "edge": -0.9,
         "beats_baseline": false,
         "train_samples": 14903
       }
