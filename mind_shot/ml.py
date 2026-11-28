@@ -596,8 +596,8 @@ def _shared_update(shared: Dict[str, Any], snap: Dict[str, Any], won: bool) -> N
         sigma = (math.sqrt(n_old + g * g) - math.sqrt(n_old)) / FTRL_ALPHA
         zs[k] = _finite(zs.get(k, 0.0), 0.0) + g - sigma * w_old
         ns[k] = n_old + g * g
-    shared["dw"] = s_dw * _DECAY
-    shared["dl"] = s_dl * _DECAY
+    shared["dw"] = max(0.0, _finite(shared.get("dw", 0.0), 0.0)) * _DECAY
+    shared["dl"] = max(0.0, _finite(shared.get("dl", 0.0), 0.0)) * _DECAY
     for dim in shared["dims"].values():
         for wl in dim.values():
             wl[0] *= _DECAY
